@@ -217,6 +217,6 @@ export async function searchWorkspaceStructured(
 }
 
 export { invalidateWorkspaceAnalysis } from "./cache.js";
-export { reviewWorkspaceChanges } from "./impact.js";
+export { discoverWorkspaceChecks, reviewWorkspaceChanges } from "./impact.js";
 export { listAnalysisProviders, normalizeProviderPaths, registerAnalysisProvider } from "./providers.js";
 export type * from "./types.js";

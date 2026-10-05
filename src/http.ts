@@ -19,6 +19,7 @@ import {
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
+import { ManagedCheckManager } from "./checkJobOps.js";
 import { WorkspaceRegistry } from "./guard.js";
 import { redactConfigPaths } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
@@ -1623,6 +1624,8 @@ async function main(): Promise<void> {
 
   const transports = new Map<string, TransportRecord>();
   const workspaceRegistry = new WorkspaceRegistry();
+  // Managed checks outlive individual MCP transports so a reconnect can recover the same job.
+  const managedCheckManager = new ManagedCheckManager();
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   function requestSessionId(req: Request): string | undefined {
@@ -1763,7 +1766,7 @@ async function main(): Promise<void> {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createCodexProServer(config, { workspaceRegistry });
+        const server = createCodexProServer(config, { workspaceRegistry, managedCheckManager });
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);

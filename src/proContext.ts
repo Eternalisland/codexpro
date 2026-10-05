@@ -173,7 +173,7 @@ export async function buildProContext(
     Math.min(config.maxWriteBytes, 2_000_000)
   );
 
-  const status = gitStatus(config, workspace);
+  const status = gitStatus(config, workspace, guard);
   const changedFiles = parseChangedFiles(status);
   const includeImportantFiles = options.includeImportantFiles !== false;
   const includeChangedFiles = options.includeChangedFiles !== false;
@@ -223,7 +223,7 @@ export async function buildProContext(
   })).text);
 
   appendSection(parts, "Git Status", `\`\`\`text\n${status}\n\`\`\``);
-  appendSection(parts, "Recent Commits", `\`\`\`text\n${gitLog(config, workspace, 8)}\n\`\`\``);
+  appendSection(parts, "Recent Commits", `\`\`\`text\n${gitLog(config, workspace, 8, guard)}\n\`\`\``);
 
   if (options.includeDiff !== false) {
     const diff = truncateText(gitDiff(config, guard, workspace), maxDiffBytes);

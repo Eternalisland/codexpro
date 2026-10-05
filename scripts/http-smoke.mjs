@@ -223,9 +223,14 @@ await fs.writeFile(path.join(root, '.codex', 'skills', 'http-smoke-skill', 'SKIL
   ''
 ].join('\n'), 'utf8');
 await fs.writeFile(path.join(root, 'session-checkpoint.txt'), 'checkpoint initial\n', 'utf8');
+await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({
+  scripts: {
+    'verify:shared': `node -e "require('fs').appendFileSync('run-count.txt','run\\n'); console.log('shared-start'); setTimeout(() => console.log('shared-done'), 750)"`
+  }
+}, null, 2), 'utf8');
 for (const args of [
   ['init'],
-  ['add', '.codex/skills/http-smoke-skill/SKILL.md', 'session-checkpoint.txt'],
+  ['add', '.codex/skills/http-smoke-skill/SKILL.md', 'session-checkpoint.txt', 'package.json'],
   ['-c', 'user.email=smoke@example.com', '-c', 'user.name=Smoke Test', 'commit', '-m', 'http smoke fixture']
 ]) {
   const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
@@ -536,7 +541,7 @@ try {
 
   const queryTools = await listTools(`${baseUrl}/mcp?codexpro_token=${encodeURIComponent(token)}`);
   const queryToolNames = toolNames(queryTools);
-  for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+  for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'start_check', 'wait_check', 'stop_check', 'get_check', 'list_checks', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
     if (!queryToolNames.includes(expected)) {
       throw new Error(`URL-token MCP tools/list missing ${expected}; got ${queryToolNames.join(', ')}`);
     }
@@ -580,6 +585,78 @@ try {
       throw new Error(`show_changes checkpoint leaked across HTTP sessions: ${JSON.stringify(changes.structuredContent)}`);
     }
   });
+  const resumableRequestId = 'http-resume-request-001';
+  const startedJob = await withClient(mcpUrl, async (firstClient) => {
+    const started = await callTool(firstClient, 'start_check', {
+      request_id: resumableRequestId,
+      checks: ['verify:shared'],
+      target_paths: ['package.json'],
+      timeout_ms: 30_000
+    });
+    if (!started.structuredContent.job_id || started.structuredContent.reused !== false) {
+      throw new Error(`first HTTP session did not start a fresh resumable check: ${JSON.stringify(started.structuredContent)}`);
+    }
+    return started.structuredContent.job_id;
+  });
+
+  await withClient(mcpUrl, async (reconnectedClient) => {
+    const recovered = await callTool(reconnectedClient, 'get_check', {
+      request_id: resumableRequestId
+    });
+    if (recovered.structuredContent.job_id !== startedJob) {
+      throw new Error(`new HTTP session could not recover the previous job: ${JSON.stringify(recovered.structuredContent)}`);
+    }
+
+    const retried = await callTool(reconnectedClient, 'start_check', {
+      request_id: resumableRequestId,
+      checks: ['verify:shared'],
+      target_paths: ['package.json']
+    });
+    if (retried.structuredContent.job_id !== startedJob || retried.structuredContent.reused !== true) {
+      throw new Error(`idempotent start_check created a duplicate job: ${JSON.stringify(retried.structuredContent)}`);
+    }
+
+    const conflictingRetry = await reconnectedClient.callTool({
+      name: 'start_check',
+      arguments: {
+        request_id: resumableRequestId,
+        checks: ['verify:cancel'],
+        target_paths: ['package.json'],
+        timeout_ms: 30_000
+      }
+    });
+    const conflictingText = conflictingRetry.content?.find?.((part) => part.type === 'text')?.text ?? '';
+    if (!conflictingRetry.isError || !conflictingText.includes('different check request')) {
+      throw new Error(`reused request_id with different parameters was not rejected: ${JSON.stringify(conflictingRetry)}`);
+    }
+
+    const listed = await callTool(reconnectedClient, 'list_checks', {
+      workspace_id: recovered.structuredContent.workspace_id,
+      status: ['running', 'completed']
+    });
+    if (!listed.structuredContent.jobs?.some((job) => job.job_id === startedJob && job.request_id === resumableRequestId)) {
+      throw new Error(`list_checks did not expose the recoverable job: ${JSON.stringify(listed.structuredContent)}`);
+    }
+
+    let completed;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      completed = await callTool(reconnectedClient, 'wait_check', {
+        job_id: startedJob,
+        wait_ms: 3_000,
+        max_chars: 5_000
+      });
+      if (completed.structuredContent.status !== 'running') break;
+    }
+    if (completed?.structuredContent.status !== 'completed' || completed?.structuredContent.result?.ok !== true) {
+      throw new Error(`recovered HTTP job did not eventually complete successfully: ${JSON.stringify(completed?.structuredContent)}`);
+    }
+  });
+
+  const runCount = (await fs.readFile(path.join(root, 'run-count.txt'), 'utf8')).trim().split(/\r?\n/).filter(Boolean);
+  if (runCount.length !== 1) {
+    throw new Error(`idempotent retry executed verify:shared ${runCount.length} times`);
+  }
+
   const unknownSession = '00000000-0000-4000-8000-000000000000';
   await expectSessionNotFound(await postToolsListWithSession(baseUrl, token, unknownSession), 'unknown POST session');
   await expectSessionNotFound(await fetch(`${baseUrl}/mcp?codexpro_token=${encodeURIComponent(token)}`, {

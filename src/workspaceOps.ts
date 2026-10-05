@@ -6,9 +6,18 @@ import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { PathGuard } from "./guard.js";
 import { readTextFile, repoTree, ensureAiBridge } from "./fsOps.js";
-import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
+import { gitDiff, gitLog, gitRepositoryInventory, gitStatus, type GitRepositoryInfo } from "./gitOps.js";
 import { discoverSkillInventory } from "./capabilitiesOps.js";
 import type { SkillInventoryItem } from "./capabilitiesOps.js";
+import { discoverWorkspaceChecks } from "./analysis/impact.js";
+
+export interface WorkspaceProjectSummary {
+  path: string;
+  manifests: string[];
+  runners: string[];
+  agentsFiles: string[];
+  checks: Array<{ check: string; command: string; cwd: string; runner?: string; runnable: boolean; source: string }>;
+}
 
 export interface WorkspaceSummary {
   text: string;
@@ -21,6 +30,8 @@ export interface WorkspaceSummary {
   skillCounts: Record<string, number>;
   tree?: string;
   gitStatus: string;
+  repositories: GitRepositoryInfo[];
+  projects: WorkspaceProjectSummary[];
 }
 
 export interface CodexContext {
@@ -111,6 +122,25 @@ async function findAgentsFilesInDir(workspace: Workspace, dir: string): Promise<
   return out;
 }
 
+async function findAgentsChainFiles(workspace: Workspace, targetPath: string): Promise<string[]> {
+  const files: string[] = [];
+  const seenRealPaths = new Set<string>();
+  const candidates = (
+    await Promise.all(candidateAgentDirs(targetPath).map((dir) => findAgentsFilesInDir(workspace, dir || ".")))
+  ).flat();
+  for (const rel of candidates) {
+    try {
+      const real = fs.realpathSync(path.join(workspace.root, rel)).toLowerCase();
+      if (seenRealPaths.has(real)) continue;
+      seenRealPaths.add(real);
+      files.push(rel);
+    } catch {
+      // Ignore instruction files that disappear during discovery.
+    }
+  }
+  return files;
+}
+
 async function readAgentsChain(
   config: CodexProConfig,
   guard: PathGuard,
@@ -176,12 +206,42 @@ export async function workspaceSummary(
     treeText = tree.text;
   }
 
-  const status = gitStatus(config, workspace);
-  const log = gitLog(config, workspace, 5);
+  const repositoryInventory = gitRepositoryInventory(config, guard, workspace);
+  const status = gitStatus(config, workspace, guard);
+  const log = gitLog(config, workspace, 5, guard);
+  const recommendations = config.analysisEnabled
+    ? await discoverWorkspaceChecks(config, guard, workspace)
+    : [];
+  const projectMap = new Map<string, WorkspaceProjectSummary>();
+  for (const recommendation of recommendations) {
+    const projectPath = recommendation.projectPath ?? recommendation.cwd ?? ".";
+    const project = projectMap.get(projectPath) ?? {
+      path: projectPath,
+      manifests: [],
+      runners: [],
+      agentsFiles: [],
+      checks: []
+    };
+    if (!project.manifests.includes(recommendation.source)) project.manifests.push(recommendation.source);
+    if (recommendation.runner && !project.runners.includes(recommendation.runner)) project.runners.push(recommendation.runner);
+    project.checks.push({
+      check: recommendation.check,
+      command: recommendation.command,
+      cwd: recommendation.cwd ?? ".",
+      runner: recommendation.runner,
+      runnable: recommendation.runnable !== false,
+      source: recommendation.source
+    });
+    projectMap.set(projectPath, project);
+  }
+  const projects = [...projectMap.values()].sort((left, right) => left.path.localeCompare(right.path));
+  await Promise.all(projects.map(async (project) => {
+    project.agentsFiles = await findAgentsChainFiles(workspace, project.path);
+  }));
   const skillText = options.includeSkills
     ? `Skills: ${counts.total} total (${counts.workspace ?? 0} workspace, ${counts.user ?? 0} user, ${counts.plugin ?? 0} plugin, ${counts.other ?? 0} other).`
     : "Skills: skipped. Pass include_skills=true if skill discovery is needed.";
-  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}\n\n## Recent commits\n\n${log}\n${treeText ? `\n## Files\n\n${treeText}` : ""}`;
+  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\nRepositories: ${repositoryInventory.repositories.length}\nVerification projects: ${projects.length}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}\n\n## Recent commits\n\n${log}\n${treeText ? `\n## Files\n\n${treeText}` : ""}`;
 
   return {
     text,
@@ -193,7 +253,9 @@ export async function workspaceSummary(
     skillInventory,
     skillCounts: counts,
     tree: treeText,
-    gitStatus: status
+    gitStatus: status,
+    repositories: repositoryInventory.repositories,
+    projects
   };
 }
 
@@ -255,7 +317,7 @@ export async function readCodexContext(
   const ai = options.includeAiBridge === false
     ? { text: "Skipped by request.", files: [] }
     : await readAiBridgeContext(config, guard, workspace);
-  const status = options.includeGit === false ? undefined : gitStatus(config, workspace);
+  const status = options.includeGit === false ? undefined : gitStatus(config, workspace, guard);
   const diff = options.includeDiff ? gitDiff(config, guard, workspace) : undefined;
 
   const text = [

@@ -4,7 +4,7 @@ import type { CodexProConfig } from "../config.js";
 import type { PathGuard, Workspace } from "../guard.js";
 import { detectRiskSignals } from "./classify.js";
 import { inspectWorkspace } from "./index.js";
-import type { ChangeAnalysis, AnalysisCommandRecommendation, AnalysisRiskSignal } from "./types.js";
+import type { ChangeAnalysis, AnalysisCommandRecommendation, AnalysisRiskSignal, WorkspaceAnalysis } from "./types.js";
 
 const RISK_LABELS: Record<AnalysisRiskSignal["id"], string> = {
   "public-api": "Public API",
@@ -15,15 +15,77 @@ const RISK_LABELS: Record<AnalysisRiskSignal["id"], string> = {
   configuration: "Runtime configuration"
 };
 
-const SCRIPT_PRIORITY = ["test", "test:unit", "typecheck", "lint", "build", "check"];
+const CHECK_PRIORITY = ["test", "typecheck", "lint", "build", "check", "smoke", "verify"];
 const SAFE_SCRIPT = /^[A-Za-z0-9._:-]+$/;
 type PackageRunner = "npm" | "pnpm" | "yarn" | "bun";
 
-async function packageRunner(guard: PathGuard, workspace: Workspace, packageJson: Record<string, unknown>): Promise<PackageRunner> {
-  const declared = typeof packageJson.packageManager === "string"
+interface ProjectManifest {
+  path: string;
+  projectPath: string;
+  name: string;
+}
+
+const NATIVE_MANIFESTS = new Set(["go.mod", "Cargo.toml", "Package.swift", "pyproject.toml", "pom.xml"]);
+
+function joinProjectPath(projectPath: string, fileName: string): string {
+  return projectPath === "." ? fileName : `${projectPath}/${fileName}`;
+}
+
+function projectPathForManifest(manifestPath: string): string {
+  const directory = path.posix.dirname(manifestPath);
+  return directory === "." ? "." : directory;
+}
+
+function pathBelongsToProject(filePath: string, projectPath: string): boolean {
+  return projectPath === "." || filePath === projectPath || filePath.startsWith(`${projectPath}/`);
+}
+
+function projectDepth(projectPath: string): number {
+  return projectPath === "." ? 0 : projectPath.split("/").length;
+}
+
+function checkForScript(script: string): string | undefined {
+  const normalized = script.toLowerCase();
+  return CHECK_PRIORITY.find((check) => normalized === check || normalized.startsWith(`${check}:`));
+}
+
+function commandRunnable(config: CodexProConfig, safeModeAllowed: boolean): boolean {
+  return config.bashMode === "full" || (config.bashMode === "safe" && safeModeAllowed);
+}
+
+function declaredPackageRunner(packageJson: Record<string, unknown>): PackageRunner | undefined {
+  return typeof packageJson.packageManager === "string"
     ? packageJson.packageManager.match(/^(npm|pnpm|yarn|bun)(?:@|$)/)?.[1] as PackageRunner | undefined
     : undefined;
-  if (declared) return declared;
+}
+
+async function readPackageJson(guard: PathGuard, workspace: Workspace, manifestPath: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(guard.resolve(workspace, manifestPath).absPath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function projectAncestors(projectPath: string): string[] {
+  const ancestors: string[] = [];
+  let current = projectPath;
+  while (true) {
+    ancestors.push(current);
+    if (current === ".") break;
+    const parent = path.posix.dirname(current);
+    current = parent === "." ? "." : parent;
+  }
+  return ancestors;
+}
+
+async function packageRunner(
+  guard: PathGuard,
+  workspace: Workspace,
+  projectPath: string,
+  packageJson: Record<string, unknown>
+): Promise<PackageRunner> {
   const lockfiles: Array<[string, PackageRunner]> = [
     ["pnpm-lock.yaml", "pnpm"],
     ["yarn.lock", "yarn"],
@@ -32,11 +94,20 @@ async function packageRunner(guard: PathGuard, workspace: Workspace, packageJson
     ["package-lock.json", "npm"],
     ["npm-shrinkwrap.json", "npm"]
   ];
-  for (const [lockfile, runner] of lockfiles) {
-    try {
-      if ((await fsp.stat(guard.resolve(workspace, lockfile).absPath)).isFile()) return runner;
-    } catch {
-      // Continue to the next package-manager marker.
+
+  // Nested packages commonly inherit the package manager and lockfile from a workspace ancestor.
+  for (const ancestor of projectAncestors(projectPath)) {
+    const ancestorPackage = ancestor === projectPath
+      ? packageJson
+      : await readPackageJson(guard, workspace, joinProjectPath(ancestor, "package.json"));
+    const declared = ancestorPackage ? declaredPackageRunner(ancestorPackage) : undefined;
+    if (declared) return declared;
+    for (const [lockfile, runner] of lockfiles) {
+      try {
+        if ((await fsp.stat(guard.resolve(workspace, joinProjectPath(ancestor, lockfile)).absPath)).isFile()) return runner;
+      } catch {
+        // Continue to the next package-manager marker or ancestor.
+      }
     }
   }
   return "npm";
@@ -48,48 +119,122 @@ function packageCommand(runner: PackageRunner, script: string): string {
   return `${runner} run ${script}`;
 }
 
-async function packageRecommendations(guard: PathGuard, workspace: Workspace): Promise<AnalysisCommandRecommendation[]> {
-  try {
-    const resolved = guard.resolve(workspace, "package.json");
-    const parsed = JSON.parse(await fsp.readFile(resolved.absPath, "utf8"));
-    const scripts = parsed?.scripts && typeof parsed.scripts === "object" ? parsed.scripts : {};
-    const runner = await packageRunner(guard, workspace, parsed);
-    return SCRIPT_PRIORITY
-      .filter((name) => typeof scripts[name] === "string" && SAFE_SCRIPT.test(name))
-      .map((name) => ({
+async function packageRecommendations(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  manifest: ProjectManifest
+): Promise<AnalysisCommandRecommendation[]> {
+  const parsed = await readPackageJson(guard, workspace, manifest.path);
+  if (!parsed) return [];
+  const scripts = parsed.scripts && typeof parsed.scripts === "object" && !Array.isArray(parsed.scripts)
+    ? parsed.scripts as Record<string, unknown>
+    : {};
+  const runner = await packageRunner(guard, workspace, manifest.projectPath, parsed);
+  return Object.keys(scripts)
+    .filter((name) => typeof scripts[name] === "string" && SAFE_SCRIPT.test(name) && Boolean(checkForScript(name)))
+    .sort((left, right) => {
+      const leftCheck = checkForScript(left) ?? left;
+      const rightCheck = checkForScript(right) ?? right;
+      return CHECK_PRIORITY.indexOf(leftCheck) - CHECK_PRIORITY.indexOf(rightCheck) || left.localeCompare(right);
+    })
+    .map((name) => {
+      const check = checkForScript(name) ?? name;
+      // Safe bash currently accepts package scripts in these categories; other discovered checks remain advisory.
+      const safeModeAllowed = ["test", "typecheck", "lint", "build", "check", "smoke", "verify"].includes(check);
+      return {
         command: packageCommand(runner, name),
-        source: "package.json",
-        reasons: ["existing project script", `${runner} project`, name.includes("test") ? "related test coverage" : "project verification"]
-      }));
-  } catch {
-    return [];
-  }
+        source: manifest.path,
+        reasons: ["existing project script", `${runner} project`, check === "test" ? "related test coverage" : "project verification"],
+        check,
+        cwd: manifest.projectPath,
+        projectPath: manifest.projectPath,
+        runner,
+        runnable: commandRunnable(config, safeModeAllowed)
+      };
+    });
 }
 
-async function nativeRecommendations(guard: PathGuard, workspace: Workspace): Promise<AnalysisCommandRecommendation[]> {
-  const candidates = [
-    { manifest: "go.mod", command: "go test ./..." },
-    { manifest: "Cargo.toml", command: "cargo test" },
-    { manifest: "Package.swift", command: "swift test" },
-    { manifest: "pyproject.toml", command: "python3 -m pytest" },
-    { manifest: "pom.xml", command: "mvn test" }
-  ];
-  const recommendations: AnalysisCommandRecommendation[] = [];
-  for (const candidate of candidates) {
-    try {
-      const resolved = guard.resolve(workspace, candidate.manifest);
-      const stat = await fsp.stat(resolved.absPath);
-      if (!stat.isFile()) continue;
-      recommendations.push({
-        command: candidate.command,
-        source: candidate.manifest,
-        reasons: ["detected project manifest", "native project verification"]
-      });
-    } catch {
-      // Missing or blocked manifests do not create recommendations.
+function nativeRecommendation(config: CodexProConfig, manifest: ProjectManifest): AnalysisCommandRecommendation | undefined {
+  const pythonCommand = process.platform === "win32" ? "python -m pytest" : "python3 -m pytest";
+  const candidates: Record<string, { command: string; runner: string; check: string; safeModeAllowed: boolean }> = {
+    "go.mod": { command: "go test ./...", runner: "go", check: "test", safeModeAllowed: true },
+    "Cargo.toml": { command: "cargo test", runner: "cargo", check: "test", safeModeAllowed: true },
+    "Package.swift": { command: "swift test", runner: "swift", check: "test", safeModeAllowed: false },
+    "pyproject.toml": { command: pythonCommand, runner: "python", check: "test", safeModeAllowed: true },
+    "pom.xml": { command: "mvn test", runner: "mvn", check: "test", safeModeAllowed: false }
+  };
+  const candidate = candidates[manifest.name];
+  if (!candidate) return undefined;
+  return {
+    command: candidate.command,
+    source: manifest.path,
+    reasons: ["detected project manifest", "native project verification"],
+    check: candidate.check,
+    cwd: manifest.projectPath,
+    projectPath: manifest.projectPath,
+    runner: candidate.runner,
+    runnable: commandRunnable(config, candidate.safeModeAllowed)
+  };
+}
+
+function discoveredManifests(analysis: WorkspaceAnalysis): ProjectManifest[] {
+  return analysis.files
+    .filter((file) => path.posix.basename(file.path) === "package.json" || NATIVE_MANIFESTS.has(path.posix.basename(file.path)))
+    .map((file) => ({
+      path: file.path,
+      projectPath: projectPathForManifest(file.path),
+      name: path.posix.basename(file.path)
+    }));
+}
+
+function relevantProjectPaths(manifests: ProjectManifest[], changedPaths: string[]): Set<string> {
+  const allProjectPaths = [...new Set(manifests.map((manifest) => manifest.projectPath))];
+  if (changedPaths.length === 0) return new Set(allProjectPaths);
+
+  const selected = new Set<string>();
+  for (const changedPath of changedPaths) {
+    const containing = allProjectPaths.filter((projectPath) => pathBelongsToProject(changedPath, projectPath));
+    const nearestDepth = Math.max(-1, ...containing.map(projectDepth));
+    for (const projectPath of containing) {
+      if (projectDepth(projectPath) === nearestDepth) selected.add(projectPath);
     }
   }
-  return recommendations;
+  return selected;
+}
+
+export async function discoverWorkspaceChecks(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  options: { changedPaths?: string[]; analysis?: WorkspaceAnalysis } = {}
+): Promise<AnalysisCommandRecommendation[]> {
+  const analysis = options.analysis ?? await inspectWorkspace(config, guard, workspace);
+  const manifests = discoveredManifests(analysis);
+  const selectedProjects = relevantProjectPaths(manifests, options.changedPaths ?? []);
+  const selectedManifests = manifests.filter((manifest) => selectedProjects.has(manifest.projectPath));
+  const recommendations: AnalysisCommandRecommendation[] = [];
+
+  for (const manifest of selectedManifests) {
+    if (manifest.name === "package.json") {
+      recommendations.push(...await packageRecommendations(config, guard, workspace, manifest));
+      continue;
+    }
+    const recommendation = nativeRecommendation(config, manifest);
+    if (recommendation) recommendations.push(recommendation);
+  }
+
+  // Different manifests can legitimately propose the same command; keep one command per project root.
+  const unique = new Map<string, AnalysisCommandRecommendation>();
+  for (const recommendation of recommendations) {
+    const key = `${recommendation.cwd ?? "."}\0${recommendation.command}`;
+    if (!unique.has(key)) unique.set(key, recommendation);
+  }
+  return [...unique.values()].sort((left, right) =>
+    (left.projectPath ?? ".").localeCompare(right.projectPath ?? ".") ||
+    CHECK_PRIORITY.indexOf(left.check) - CHECK_PRIORITY.indexOf(right.check) ||
+    left.command.localeCompare(right.command)
+  );
 }
 
 export async function reviewWorkspaceChanges(
@@ -162,7 +307,7 @@ export async function reviewWorkspaceChanges(
     dependentFiles: dependentFiles.slice(0, resultLimit),
     relatedTests: relatedTests.slice(0, resultLimit),
     riskSignals,
-    recommendedCommands: [...await packageRecommendations(guard, workspace), ...await nativeRecommendations(guard, workspace)],
+    recommendedCommands: await discoverWorkspaceChecks(config, guard, workspace, { changedPaths, analysis }),
     coverage: analysis.coverage,
     warnings: [
       ...analysis.warnings,

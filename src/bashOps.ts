@@ -12,12 +12,18 @@ import { redactSensitiveText } from "./redact.js";
 export interface BashResult {
   command: string;
   cwd: string;
+  ok: boolean;
+  status: "passed" | "failed" | "timed_out" | "cancelled";
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   durationMs: number;
   stdout: string;
   stderr: string;
   truncated: boolean;
+  timedOut: boolean;
+  cancelled: boolean;
+  outputLimitExceeded: boolean;
+  observedOutputBytes: number;
   bashRuntime: BashRuntime;
   bashExecutable: string;
   bashSessionId?: string;
@@ -143,7 +149,7 @@ function startsWithAllowedPrefix(command: string): boolean {
 
 function isAllowedPackageScript(command: string): boolean {
   const packageScriptPattern =
-    /^(?:npm|pnpm|yarn|bun)\s+run\s+(?:test|typecheck|lint|build|check)(?::[A-Za-z0-9._-]+)*(?:\s+--\s+[A-Za-z0-9._:= -]+)?$/;
+    /^(?:npm|pnpm|yarn|bun)\s+run\s+(?:test|typecheck|lint|build|check|smoke|verify)(?::[A-Za-z0-9._-]+)*(?:\s+--\s+[A-Za-z0-9._:= -]+)?$/;
   return packageScriptPattern.test(command);
 }
 
@@ -496,7 +502,7 @@ export async function runBash(
   guard: PathGuard,
   workspace: Workspace,
   command: string,
-  options: { cwd?: string; timeoutMs?: number; sessionId?: string } = {}
+  options: { cwd?: string; timeoutMs?: number; sessionId?: string; signal?: AbortSignal } = {}
 ): Promise<BashResult> {
   if (!command?.trim()) throw new CodexProError("command is required.");
   const bashSessionId = assertBashSession(config, options.sessionId);
@@ -506,6 +512,27 @@ export async function runBash(
   const invocation = resolveBashInvocation(config);
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 30_000, config.maxBashTimeoutMs));
   const start = Date.now();
+  if (options.signal?.aborted) {
+    return {
+      command,
+      cwd: path.relative(workspace.root, cwd) || ".",
+      ok: false,
+      status: "cancelled",
+      exitCode: null,
+      signal: null,
+      durationMs: 0,
+      stdout: "",
+      stderr: "[codexpro] Command cancelled before start.",
+      truncated: false,
+      timedOut: false,
+      cancelled: true,
+      outputLimitExceeded: false,
+      observedOutputBytes: 0,
+      bashRuntime: invocation.runtime,
+      bashExecutable: invocation.executable,
+      ...(bashSessionId ? { bashSessionId } : {})
+    };
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn(invocation.executable, invocation.args(command), {
@@ -519,12 +546,13 @@ export async function runBash(
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let killedByTimeout = false;
-    let killedByOutputLimit = false;
+    let killedByAbort = false;
+    let outputLimitExceeded = false;
     let closed = false;
     let terminationStarted = false;
     let killTimer: NodeJS.Timeout | undefined;
     let observedOutputBytes = 0;
-    const retainedOutputBytes = config.maxOutputBytes + 1;
+    const retainedOutputBytes = config.maxOutputBytes;
 
     const terminate = (signal: NodeJS.Signals) => {
       if (closed) return;
@@ -537,9 +565,11 @@ export async function runBash(
       killTimer = setTimeout(() => terminate("SIGKILL"), 1_500);
       killTimer.unref();
     };
+    // Output limits bound what MCP retains; they must not terminate a test whose exit code is still needed for diagnosis.
     let retainedBytes = 0;
     const appendBounded = (chunks: Buffer[], chunk: Buffer) => {
       observedOutputBytes += chunk.byteLength;
+      if (observedOutputBytes > config.maxOutputBytes) outputLimitExceeded = true;
       const remaining = retainedOutputBytes - retainedBytes;
       if (remaining <= 0) return;
       const retained = chunk.subarray(0, remaining);
@@ -552,43 +582,56 @@ export async function runBash(
       terminateWithEscalation();
     }, timeoutMs);
     timer.unref();
+    const abort = () => {
+      killedByAbort = true;
+      terminateWithEscalation();
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
 
     child.stdout.on("data", (chunk) => {
       appendBounded(stdoutChunks, Buffer.from(chunk));
-      if (observedOutputBytes > config.maxOutputBytes) {
-        killedByOutputLimit = true;
-        terminateWithEscalation();
-      }
     });
     child.stderr.on("data", (chunk) => {
       appendBounded(stderrChunks, Buffer.from(chunk));
-      if (observedOutputBytes > config.maxOutputBytes) {
-        killedByOutputLimit = true;
-        terminateWithEscalation();
-      }
     });
-    child.on("error", reject);
-    child.on("close", (exitCode, signal) => {
+    child.on("error", (error) => {
       closed = true;
+      options.signal?.removeEventListener("abort", abort);
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
-      const allowTrailingIncompleteUtf8 = killedByTimeout || killedByOutputLimit;
+      reject(error);
+    });
+    child.on("close", (exitCode, signal) => {
+      closed = true;
+      options.signal?.removeEventListener("abort", abort);
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      const allowTrailingIncompleteUtf8 = killedByAbort || killedByTimeout || outputLimitExceeded;
       const stdout = decodeBashOutput(Buffer.concat(stdoutChunks), process.platform, allowTrailingIncompleteUtf8);
       let stderr = decodeBashOutput(Buffer.concat(stderrChunks), process.platform, allowTrailingIncompleteUtf8);
-      if (killedByTimeout) {
+      if (killedByAbort) {
+        stderr += "\n[codexpro] Command cancelled.";
+      } else if (killedByTimeout) {
         stderr += `\n[codexpro] Command timed out after ${timeoutMs} ms.`;
       }
       const out = trimOutput(redactSensitiveText(stdout), config.maxOutputBytes);
       const err = trimOutput(redactSensitiveText(stderr), config.maxOutputBytes);
+      const ok = !killedByAbort && !killedByTimeout && exitCode === 0 && signal === null;
       resolve({
         command,
         cwd: path.relative(workspace.root, cwd) || ".",
+        ok,
+        status: killedByAbort ? "cancelled" : killedByTimeout ? "timed_out" : ok ? "passed" : "failed",
         exitCode,
         signal,
         durationMs: Date.now() - start,
         stdout: out.value,
         stderr: err.value,
-        truncated: out.truncated || err.truncated,
+        truncated: outputLimitExceeded || out.truncated || err.truncated,
+        timedOut: killedByTimeout,
+        cancelled: killedByAbort,
+        outputLimitExceeded,
+        observedOutputBytes,
         bashRuntime: invocation.runtime,
         bashExecutable: invocation.executable,
         ...(bashSessionId ? { bashSessionId } : {})

@@ -225,6 +225,7 @@ const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--al
     ...process.env,
     CODEXPRO_ROOT: tmp,
     CODEXPRO_ALLOWED_ROOTS: [tmp, alternateWorkspace].join(path.delimiter),
+    CODEXPRO_BASH_TRANSCRIPT: 'compact',
     CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test',
     CODEXPRO_TOOL_CARDS: '0'
   }
@@ -790,7 +791,7 @@ if (!changes.structuredContent.analysis?.recommended_commands?.some((item) => it
   throw new Error(`show_changes omitted existing npm test recommendation: ${JSON.stringify(changes.structuredContent.analysis)}`);
 }
 const repeatedChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws } });
-if (repeatedChanges.structuredContent.changed || repeatedChanges.structuredContent.diff || repeatedChanges.structuredContent.review_checkpoint_hit !== true || repeatedChanges.structuredContent.additions !== 0 || repeatedChanges.structuredContent.deletions !== 0) {
+if (!repeatedChanges.structuredContent.changed || repeatedChanges.structuredContent.new_since_review !== false || repeatedChanges.structuredContent.diff || repeatedChanges.structuredContent.review_checkpoint_hit !== true || repeatedChanges.structuredContent.additions !== changes.structuredContent.additions || repeatedChanges.structuredContent.deletions !== changes.structuredContent.deletions) {
   throw new Error(`show_changes repeated the same review instead of using the last-shown checkpoint: ${JSON.stringify(repeatedChanges.structuredContent)}`);
 }
 if ('analysis' in repeatedChanges.structuredContent) {
@@ -869,6 +870,20 @@ if (!nestedPatch.isError || await fs.readFile(nestedDeletePath, 'utf8') !== 'tem
 nestedClient.close();
 
 const wideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-wide-root-'));
+const nestedRepoA = path.join(wideRoot, 'project-a');
+await fs.mkdir(nestedRepoA);
+const nestedRepoFileA = path.join(nestedRepoA, 'tracked-a.txt');
+const nestedRepoQuotedFileA = path.join(nestedRepoA, '带 空格.txt');
+const nestedRepoUntrackedA = path.join(nestedRepoA, '未跟踪 文件.txt');
+await fs.writeFile(nestedRepoFileA, 'before-a\n', 'utf8');
+await fs.writeFile(nestedRepoQuotedFileA, 'quoted-before-a\n', 'utf8');
+for (const args of [['init'], ['config', 'user.email', 'codexpro-smoke@example.com'], ['config', 'user.name', 'CodexPro Smoke'], ['config', 'core.quotepath', 'true'], ['add', 'tracked-a.txt', '带 空格.txt'], ['commit', '-m', 'baseline']]) {
+  const result = spawnSync('git', args, { cwd: nestedRepoA, encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(`wide-root project-a git ${args.join(' ')} failed: ${result.stderr || result.stdout}`);
+}
+await fs.writeFile(nestedRepoFileA, 'after-a\n', 'utf8');
+await fs.writeFile(nestedRepoQuotedFileA, 'quoted-after-a\n', 'utf8');
+await fs.writeFile(nestedRepoUntrackedA, 'untracked-a\n', 'utf8');
 const nestedRepo = path.join(wideRoot, 'project-b');
 await fs.mkdir(nestedRepo);
 const nestedRepoFile = path.join(nestedRepo, 'tracked.txt');
@@ -902,6 +917,61 @@ const wideDiff = await wideClient.request('tools/call', {
 });
 if (wideDiff.isError || !wideDiff.structuredContent.diff?.includes?.('after')) {
   throw new Error(`path-scoped Git diff did not use the nearest nested repository: ${JSON.stringify(wideDiff.structuredContent)}`);
+}
+// 无 path 的评审调用必须聚合宽工作区中的所有子 Git 仓库，而不是在非 Git 根目录报错。
+const wideAggregateStatus = await wideClient.request('tools/call', {
+  name: 'git_status',
+  arguments: { workspace_id: wideOpened.structuredContent.workspace_id }
+});
+if (
+  wideAggregateStatus.isError ||
+  !wideAggregateStatus.structuredContent.changed_files?.some?.((file) => file.includes('project-a/tracked-a.txt')) ||
+  !wideAggregateStatus.structuredContent.changed_files?.some?.((file) => file.includes('project-a/带 空格.txt')) ||
+  !wideAggregateStatus.structuredContent.changed_files?.some?.((file) => file.includes('project-a/未跟踪 文件.txt')) ||
+  !wideAggregateStatus.structuredContent.changed_files?.some?.((file) => file.includes('project-b/tracked.txt'))
+) {
+  throw new Error(`workspace Git status did not aggregate nested repositories: ${JSON.stringify(wideAggregateStatus.structuredContent)}`);
+}
+const wideAggregateDiff = await wideClient.request('tools/call', {
+  name: 'git_diff',
+  arguments: { workspace_id: wideOpened.structuredContent.workspace_id }
+});
+if (
+  wideAggregateDiff.isError ||
+  !wideAggregateDiff.structuredContent.diff?.includes?.('### Repository: project-a') ||
+  !wideAggregateDiff.structuredContent.diff?.includes?.('### Repository: project-b') ||
+  !wideAggregateDiff.structuredContent.diff?.includes?.('after-a') ||
+  !wideAggregateDiff.structuredContent.diff?.includes?.('quoted-after-a') ||
+  !wideAggregateDiff.structuredContent.diff?.includes?.('after')
+) {
+  throw new Error(`workspace Git diff did not aggregate nested repositories: ${JSON.stringify(wideAggregateDiff.structuredContent)}`);
+}
+const wideAggregateStats = await wideClient.request('tools/call', {
+  name: 'git_diff',
+  arguments: { workspace_id: wideOpened.structuredContent.workspace_id, include_diff: false }
+});
+if (
+  wideAggregateStats.isError ||
+  !wideAggregateStats.structuredContent.changed ||
+  wideAggregateStats.structuredContent.additions !== 3 ||
+  wideAggregateStats.structuredContent.deletions !== 3
+) {
+  throw new Error(`workspace Git diff stats did not aggregate nested repositories: ${JSON.stringify(wideAggregateStats.structuredContent)}`);
+}
+const wideChanges = await wideClient.request('tools/call', {
+  name: 'show_changes',
+  arguments: { workspace_id: wideOpened.structuredContent.workspace_id, since: 'workspace' }
+});
+const wideChangedPaths = wideChanges.structuredContent.analysis?.changed_paths ?? [];
+if (
+  wideChanges.isError ||
+  !wideChanges.structuredContent.changed ||
+  !wideChangedPaths.includes('project-a/tracked-a.txt') ||
+  !wideChangedPaths.includes('project-a/带 空格.txt') ||
+  !wideChangedPaths.includes('project-a/未跟踪 文件.txt') ||
+  !wideChangedPaths.includes('project-b/tracked.txt')
+) {
+  throw new Error(`show_changes did not aggregate nested repositories: ${JSON.stringify(wideChanges.structuredContent)}`);
 }
 wideClient.close();
 

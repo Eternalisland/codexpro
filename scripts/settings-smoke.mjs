@@ -255,7 +255,9 @@ const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-r
 const staleRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-stale-'));
 const ngrokRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-ngrok-'));
 const home = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-home-'));
-const env = { ...process.env, CODEXPRO_HOME: home };
+const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('CODEXPRO_')));
+env.CODEXPRO_HOME = home;
+env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = '1';
 function withoutProxyEnv(input) {
   const next = { ...input };
   for (const key of ['HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'HTTP_PROXY', 'http_proxy']) delete next[key];

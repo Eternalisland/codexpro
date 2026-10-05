@@ -6,11 +6,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MAX_BASH_TIMEOUT_MS, type CodexProConfig } from "./config.js";
 import { WorkspaceManager, PathGuard, CodexProError, type Workspace, type WorkspaceRegistry } from "./guard.js";
-import { repoTree, listFiles, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks } from "./fsOps.js";
+import { repoTree, listFiles, readTextFile, readManyTextFiles, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
 import { importAttachmentFile } from "./importOps.js";
 import { searchBackendStatus, searchWorkspace } from "./searchOps.js";
 import { bashRuntimeStatus, runBash } from "./bashOps.js";
+import { runWorkspaceChecks } from "./checkOps.js";
+import { ManagedCheckManager } from "./checkJobOps.js";
 import { gitDiff, gitDiffStats as readGitDiffStats, gitDiffStatus, gitLog, gitRuntimeStatus, gitStatus } from "./gitOps.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
@@ -340,11 +342,19 @@ const MINIMAL_TOOL_NAMES = [
   "open_current_workspace",
   "open_workspace",
   "read",
+  "read_many",
   "write",
   "edit",
   "apply_patch",
   "import_file",
   "bash",
+  "run_checks",
+  "start_check",
+  "get_check",
+  "list_checks",
+  "resume_check",
+  "wait_check",
+  "stop_check",
   "show_changes"
 ] as const;
 
@@ -375,12 +385,20 @@ const FULL_TOOL_NAMES = [
   "tree",
   "search",
   "read",
+  "read_many",
   "view_image",
   "write",
   "edit",
   "apply_patch",
   "import_file",
   "bash",
+  "run_checks",
+  "start_check",
+  "get_check",
+  "list_checks",
+  "resume_check",
+  "wait_check",
+  "stop_check",
   "git_status",
   "git_diff",
   "show_changes",
@@ -420,8 +438,10 @@ function toolNamesForMode(config: CodexProConfig): string[] {
         ? [...MINIMAL_TOOL_NAMES]
         : [...STANDARD_TOOL_NAMES];
   if (config.bashMode === "off") {
-    const bashIndex = names.indexOf("bash");
-    if (bashIndex !== -1) names.splice(bashIndex, 1);
+    for (const bashTool of ["bash", "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
+      const bashIndex = names.indexOf(bashTool);
+      if (bashIndex !== -1) names.splice(bashIndex, 1);
+    }
   }
   if (config.writeMode !== "workspace") {
     for (const writeTool of ["write", "edit", "apply_patch", "import_file"]) {
@@ -431,11 +451,13 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   }
   if (config.writeMode === "handoff" && !names.includes("handoff_to_agent")) names.push("handoff_to_agent");
   if (!config.analysisEnabled) {
-    const analysisIndex = names.indexOf("inspect_workspace");
-    if (analysisIndex !== -1) names.splice(analysisIndex, 1);
+    for (const analysisTool of ["inspect_workspace", "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
+      const analysisIndex = names.indexOf(analysisTool);
+      if (analysisIndex !== -1) names.splice(analysisIndex, 1);
+    }
   }
   if (config.connectionTest) {
-    for (const hiddenTool of CONNECTION_TEST_HIDDEN_TOOLS) {
+    for (const hiddenTool of [...CONNECTION_TEST_HIDDEN_TOOLS, "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
       const toolIndex = names.indexOf(hiddenTool);
       if (toolIndex !== -1) names.splice(toolIndex, 1);
     }
@@ -462,12 +484,12 @@ function registeredToolNames(server: McpServer): string[] {
 }
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
-  if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
-  if (name === "bash" && config.bashMode === "off") return false;
+  if (config.connectionTest && (CONNECTION_TEST_HIDDEN_TOOLS.has(name) || ["run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"].includes(name))) return false;
+  if ((name === "bash" || ["run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"].includes(name)) && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
-  if (name === "inspect_workspace" && !config.analysisEnabled) return false;
+  if ((name === "inspect_workspace" || ["run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"].includes(name)) && !config.analysisEnabled) return false;
   if (name === "handoff_to_agent" && config.writeMode === "handoff") return true;
   if (config.toolMode === "full") return true;
   if (config.toolMode === "minimal") return MINIMAL_TOOLS.has(name);
@@ -500,7 +522,7 @@ function serverInstructions(config: CodexProConfig): string {
   const bashInstruction =
     config.bashMode === "off"
       ? "5. Bash is disabled and the bash tool is unavailable. Do not attempt shell commands."
-      : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
+      : "5. Use run_checks for short verification. For checks that may outlive one MCP request, use start_check with a stable request_id and poll with wait_check. After reconnect use get_check/list_checks; after a CodexPro process restart an unfinished persisted job becomes interrupted and must be continued with resume_check, which verifies the workspace fingerprint before rerunning. Retry start_check only with the same request_id; use bash only when project-aware checks do not fit.";
 
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
@@ -750,6 +772,59 @@ function changedStatusLines(status: string): string[] {
     .filter((line) => line && line !== "(no output)" && !line.startsWith("##"));
 }
 
+function repositorySections(value: string): Array<{ repository: string; body: string }> {
+  const normalized = value.replace(/\r\n/g, "\n").trim();
+  if (!normalized || normalized === "(no output)") return [];
+  const sections: Array<{ repository: string; lines: string[] }> = [];
+  let current: { repository: string; lines: string[] } | undefined;
+  let sawHeader = false;
+  for (const line of normalized.split("\n")) {
+    const header = line.match(/^#{2,3}\s+Repository:\s+(.+)$/);
+    if (header) {
+      sawHeader = true;
+      current = { repository: header[1].trim(), lines: [] };
+      sections.push(current);
+      continue;
+    }
+    if (!current) {
+      current = { repository: ".", lines: [] };
+      sections.push(current);
+    }
+    current.lines.push(line);
+  }
+  if (!sawHeader) {
+    return [{ repository: ".", body: normalized }];
+  }
+  return sections
+    .map((section) => ({ repository: section.repository, body: section.lines.join("\n").trim() }))
+    .filter((section) => section.body);
+}
+
+function repositoryChangeSummary(
+  status: string,
+  diff: string,
+  includeDiff: boolean,
+  checkpointHit: boolean
+): Array<Record<string, unknown>> {
+  const statusSections = repositorySections(status);
+  const diffSections = repositorySections(diff);
+  const labels = [...new Set([...statusSections.map((section) => section.repository), ...diffSections.map((section) => section.repository)])];
+  return labels.map((repository) => {
+    const statusBody = statusSections.find((section) => section.repository === repository)?.body ?? "";
+    const diffBody = diffSections.find((section) => section.repository === repository)?.body ?? "";
+    const changedFiles = changedStatusLines(statusBody);
+    const repoStats = diffBody ? diffStats(diffBody) : { additions: 0, deletions: 0, changed: false };
+    const changed = changedFiles.length > 0 || repoStats.changed;
+    return {
+      repository,
+      changed_files: changedFiles,
+      changed,
+      new_since_review: !checkpointHit && changed,
+      ...(includeDiff ? { additions: repoStats.additions, deletions: repoStats.deletions } : {})
+    };
+  });
+}
+
 function changedPathsFromStatus(lines: string[]): string[] {
   const paths: string[] = [];
   for (const line of lines) {
@@ -945,16 +1020,287 @@ const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, des
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
+function registerReadManyTool(
+  config: CodexProConfig,
+  server: McpServer,
+  workspaces: WorkspaceManager,
+  guard: PathGuard
+): void {
+  registerCodexTool(
+    config,
+    server,
+    "read_many",
+    {
+      title: "Read Many Files",
+      description:
+        "Read multiple text files or line ranges in one bounded call. Returns successful files and per-file errors independently so one missing file does not discard the rest.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        files: z.array(z.object({
+          path: z.string().min(1).describe("File path relative to workspace root."),
+          start_line: z.number().int().min(1).optional().describe("Optional first line."),
+          end_line: z.number().int().min(1).optional().describe("Optional last line."),
+          max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Optional per-file output cap, also bounded by max_bytes_per_file.")
+        })).min(1).max(20).describe("Files or line ranges to read."),
+        max_bytes_per_file: z.number().int().min(1000).max(2000000).optional().describe("Default per-file output budget. Capped by server config."),
+        max_total_bytes: z.number().int().min(1000).max(2000000).optional().describe("Aggregate returned text budget across all files. Default: up to 500 KB."),
+        continue_on_error: z.boolean().optional().describe("Continue when an individual file cannot be read. Default: true.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await readManyTextFiles(
+        config,
+        guard,
+        workspace,
+        args.files.map((file: { path: string; start_line?: number; end_line?: number; max_bytes?: number }) => ({
+          path: file.path,
+          startLine: file.start_line,
+          endLine: file.end_line,
+          maxBytes: file.max_bytes
+        })),
+        {
+          maxBytesPerFile: args.max_bytes_per_file,
+          maxTotalBytes: args.max_total_bytes,
+          continueOnError: args.continue_on_error !== false
+        }
+      );
+      const sections = result.results.map((item) =>
+        `## ${item.path}\n\nLines: ${item.startLine}-${item.endLine} of ${item.totalLines}\nSHA-256: ${item.sha256}\n\n\`\`\`text\n${item.text}\n\`\`\``
+      );
+      if (result.errors.length) {
+        sections.push(`## Errors\n\n${result.errors.map((item) => `- ${item.path}: ${item.error}`).join("\n")}`);
+      }
+      return textResult(`# Read Many Files\n\n${sections.join("\n\n")}`, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        results: result.results,
+        errors: result.errors,
+        total_text_bytes: result.totalTextBytes,
+        truncated: result.truncated
+      });
+    }
+  );
+}
+
+function registerManagedCheckTools(
+  config: CodexProConfig,
+  server: McpServer,
+  workspaces: WorkspaceManager,
+  guard: PathGuard,
+  managedChecks: ManagedCheckManager
+): void {
+  registerCodexTool(
+    config,
+    server,
+    "start_check",
+    {
+      title: "Start Check",
+      description:
+        "Start project-aware verification as a managed background job. Supply a stable request_id when a transport retry is possible; retrying the same request_id returns the original job. Use wait_check for bounded log pages, get_check/list_checks after reconnect, or stop_check to cancel.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        request_id: z.string().min(8).max(128).optional().describe("Idempotency key. Reusing the same request_id with the same check request returns the existing job instead of starting a duplicate."),
+        project_path: z.string().optional().describe("Optional project root relative to the workspace."),
+        checks: z.array(z.string().min(1)).min(1).max(20).describe("Verification checks or exact package script names."),
+        target_paths: z.array(z.string().min(1)).max(100).optional().describe("Changed or target paths used to select the nearest owning subproject."),
+        session_id: z.string().optional().describe(config.requireBashSession && config.bashSessionId ? `Required bash session id for this server: ${config.bashSessionId}.` : "Optional bash session id."),
+        timeout_ms: z.number().int().min(1000).max(MAX_BASH_TIMEOUT_MS).optional().describe(`Timeout per check. Max: ${config.maxBashTimeoutMs} ms.`),
+        stop_on_failure: z.boolean().optional().describe("Stop after the first failed check. Default: false.")
+      },
+      annotations: BASH_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await managedChecks.start(config, guard, workspace, {
+        requestId: args.request_id,
+        projectPath: args.project_path,
+        checks: args.checks,
+        targetPaths: args.target_paths,
+        timeoutMs: args.timeout_ms,
+        sessionId: args.session_id,
+        stopOnFailure: args.stop_on_failure === true
+      });
+      return textResult(
+        `# Start Check\n\nJob: ${result.job_id}\nStatus: ${result.status}\nUse wait_check with this job_id to collect bounded output.`,
+        { root: workspace.root, ...result }
+      );
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "wait_check",
+    {
+      title: "Wait Check",
+      description:
+        "Read a bounded page of a managed check log and optionally wait up to 30 seconds for progress or completion. Reuse next_cursor to page through output.",
+      inputSchema: {
+        job_id: z.string().min(1).describe("Job id returned by start_check."),
+        workspace_id: z.string().optional().describe("Workspace id that owns the job. Omit to use the workspace selected for this MCP session."),
+        cursor: z.number().int().min(0).optional().describe("Character cursor returned by the previous page. Default: 0."),
+        max_chars: z.number().int().min(100).max(100000).optional().describe("Maximum log characters to return. Default: 20000."),
+        wait_ms: z.number().int().min(0).max(30000).optional().describe("Long-poll duration while the job is running. Default: 0.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await managedChecks.wait(workspace, args.job_id, {
+        cursor: args.cursor,
+        maxChars: args.max_chars,
+        waitMs: args.wait_ms
+      });
+      const text = `# Wait Check\n\nJob: ${result.job_id}\nStatus: ${result.status}\nCursor: ${result.cursor} -> ${result.next_cursor}\nMore: ${result.has_more}\n\n${result.log || "(no new output)"}`;
+      return textResult(text, { ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "stop_check",
+    {
+      title: "Stop Check",
+      description: "Cancel a running managed check and terminate its current process tree. Returns the terminal structured result when cancellation settles.",
+      inputSchema: {
+        job_id: z.string().min(1).describe("Job id returned by start_check."),
+        workspace_id: z.string().optional().describe("Workspace id that owns the job. Omit to use the workspace selected for this MCP session."),
+        cursor: z.number().int().min(0).optional().describe("Optional log cursor."),
+        max_chars: z.number().int().min(100).max(100000).optional().describe("Maximum log characters to return. Default: 20000.")
+      },
+      annotations: BASH_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await managedChecks.stop(workspace, args.job_id, {
+        cursor: args.cursor,
+        maxChars: args.max_chars
+      });
+      const text = `# Stop Check\n\nJob: ${result.job_id}\nStatus: ${result.status}\n\n${result.log || "(no output)"}`;
+      return textResult(text, { ...result });
+    }
+  );
+}
+
+function registerCheckRecoveryTools(
+  config: CodexProConfig,
+  server: McpServer,
+  workspaces: WorkspaceManager,
+  guard: PathGuard,
+  managedChecks: ManagedCheckManager
+): void {
+  registerCodexTool(
+    config,
+    server,
+    "get_check",
+    {
+      title: "Get Check",
+      description:
+        "Recover a managed check by job_id or by request_id in the selected workspace. Persisted jobs survive CodexPro process restarts; a previously running job is reported as interrupted.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        job_id: z.string().min(1).optional().describe("Known job id."),
+        request_id: z.string().min(8).max(128).optional().describe("Idempotency key originally passed to start_check."),
+        cursor: z.number().int().min(0).optional().describe("Optional log cursor. Default: 0."),
+        max_chars: z.number().int().min(100).max(100000).optional().describe("Maximum log characters to return. Default: 20000.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      if (!args.job_id && !args.request_id) throw new CodexProError("get_check requires job_id or request_id.");
+      if (args.job_id && args.request_id) throw new CodexProError("get_check accepts either job_id or request_id, not both.");
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = args.job_id
+        ? await managedChecks.getViewByJob(workspace, args.job_id, { cursor: args.cursor, maxChars: args.max_chars })
+        : await managedChecks.getViewByRequest(workspace, args.request_id, { cursor: args.cursor, maxChars: args.max_chars });
+      return textResult(
+        `# Get Check\n\nJob: ${result.job_id}\nStatus: ${result.status}\n\n${result.log || "(no output)"}`,
+        { ...result }
+      );
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "list_checks",
+    {
+      title: "List Checks",
+      description:
+        "List recent in-memory or persisted managed checks for the selected workspace so a client can recover after losing a response or restarting CodexPro.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        status: z.array(z.enum(["running", "completed", "failed", "cancelled", "interrupted"])).max(5).optional().describe("Optional status filter."),
+        limit: z.number().int().min(1).max(32).optional().describe("Maximum jobs to return. Default: 20.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const jobs = await managedChecks.list(workspace, {
+        status: args.status,
+        limit: args.limit
+      });
+      const text = jobs.length
+        ? jobs.map((job) => `- ${job.job_id}: ${job.status}${job.request_id ? ` request_id=${job.request_id}` : ""}`).join("\n")
+        : "(no managed checks)";
+      return textResult(`# List Checks\n\n${text}`, {
+        workspace_id: workspace.id,
+        jobs
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "resume_check",
+    {
+      title: "Resume Check",
+      description:
+        "Resume an interrupted persisted check after a CodexPro process restart. Resume is allowed only when the workspace fingerprint still matches the fingerprint captured before the original check.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id that owns the interrupted job. Omit to use the workspace selected for this MCP session."),
+        job_id: z.string().min(1).optional().describe("Interrupted job id."),
+        request_id: z.string().min(8).max(128).optional().describe("Original request_id from start_check."),
+        session_id: z.string().optional().describe(config.requireBashSession && config.bashSessionId ? `Required bash session id for this server: ${config.bashSessionId}.` : "Optional bash session id.")
+      },
+      annotations: BASH_ANNOTATIONS
+    },
+    async (args) => {
+      if (!args.job_id && !args.request_id) throw new CodexProError("resume_check requires job_id or request_id.");
+      if (args.job_id && args.request_id) throw new CodexProError("resume_check accepts either job_id or request_id, not both.");
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await managedChecks.resume(config, guard, workspace, {
+        jobId: args.job_id,
+        requestId: args.request_id,
+        sessionId: args.session_id
+      });
+      return textResult(
+        `# Resume Check\n\nJob: ${result.job_id}\nStatus: ${result.status}\nUse wait_check with this job_id to continue polling.`,
+        { root: workspace.root, ...result }
+      );
+    }
+  );
+}
+
 export function createCodexProServer(
   config: CodexProConfig,
-  options: { workspaceRegistry?: WorkspaceRegistry } = {}
+  options: { workspaceRegistry?: WorkspaceRegistry; managedCheckManager?: ManagedCheckManager } = {}
 ): McpServer {
   const workspaces = new WorkspaceManager(config, options.workspaceRegistry);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
+  const managedChecks = options.managedCheckManager ?? new ManagedCheckManager();
   const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
+  registerReadManyTool(config, server, workspaces, guard);
+  registerManagedCheckTools(config, server, workspaces, guard, managedChecks);
+  registerCheckRecoveryTools(config, server, workspaces, guard, managedChecks);
 
   registerCodexTool(
     config,
@@ -1196,7 +1542,7 @@ export function createCodexProServer(
       }
 
       try {
-        const status = gitStatus(config, workspace);
+        const status = gitStatus(config, workspace, guard);
         const gitFailed = looksLikeGitError(status);
         const changed = gitFailed ? 0 : changedStatusLines(status).length;
         check("git status", gitFailed ? "warn" : "pass", gitFailed ? status : `${changed} changed entries`);
@@ -1627,6 +1973,8 @@ export function createCodexProServer(
         skill_counts: summary.skillCounts,
         tree: summary.tree,
         git_status: summary.gitStatus,
+        repositories: summary.repositories,
+        projects: summary.projects,
         bash_mode: config.bashMode,
         write_mode: config.writeMode,
         tool_mode: config.toolMode
@@ -1683,6 +2031,8 @@ export function createCodexProServer(
         skill_counts: summary.skillCounts,
         tree: summary.tree,
         git_status: summary.gitStatus,
+        repositories: summary.repositories,
+        projects: summary.projects,
         bash_mode: config.bashMode,
         write_mode: config.writeMode,
         tool_mode: config.toolMode
@@ -1732,6 +2082,8 @@ export function createCodexProServer(
         skill_counts: summary.skillCounts,
         tree: summary.tree,
         git_status: summary.gitStatus,
+        repositories: summary.repositories,
+        projects: summary.projects,
         ai_context_files: ai.files,
         bash_mode: config.bashMode,
         write_mode: config.writeMode,
@@ -2229,7 +2581,73 @@ export function createCodexProServer(
         sessionId: args.session_id
       });
       const text = bashTextResult(config, result);
-      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ...result,
+        exit_code: result.exitCode,
+        timed_out: result.timedOut,
+        output_limit_exceeded: result.outputLimitExceeded,
+        output_truncated: result.truncated,
+        observed_output_bytes: result.observedOutputBytes,
+        bash_session_id: result.bashSessionId ?? null
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "run_checks",
+    {
+      title: "Run Checks",
+      description:
+        "Discover and run project-aware verification checks for the relevant subproject. Uses the existing safe bash policy, returns structured failures, and fingerprints the workspace so callers can detect stale verification results.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        project_path: z.string().optional().describe("Optional project root relative to the workspace, for example packages/api."),
+        checks: z.array(z.string().min(1)).min(1).max(20).describe("Verification checks or exact package script names, for example test, typecheck, smoke, or test:unit."),
+        target_paths: z.array(z.string().min(1)).max(100).optional().describe("Changed or target paths used to select the nearest owning subproject."),
+        session_id: z.string().optional().describe(config.requireBashSession && config.bashSessionId ? `Required bash session id for this server: ${config.bashSessionId}.` : "Optional bash session id. If configured on the server, a provided value must match it."),
+        timeout_ms: z
+          .number()
+          .int()
+          .min(1000)
+          .max(MAX_BASH_TIMEOUT_MS)
+          .optional()
+          .describe(`Timeout per check in milliseconds. Default: 30000. Max: ${config.maxBashTimeoutMs}.`),
+        stop_on_failure: z.boolean().optional().describe("Stop after the first failed check. Default: false.")
+      },
+      annotations: BASH_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await runWorkspaceChecks(config, guard, workspace, {
+        projectPath: args.project_path,
+        checks: args.checks,
+        targetPaths: args.target_paths,
+        timeoutMs: args.timeout_ms,
+        sessionId: args.session_id,
+        stopOnFailure: args.stop_on_failure === true
+      });
+      const lines = [
+        "# Run Checks",
+        "",
+        `Result: ${result.ok ? "passed" : "failed"}`,
+        `Fingerprint: ${result.workspace_fingerprint}`,
+        `Stale after run: ${result.stale}`,
+        ...(result.unavailable_checks.length ? [`Unavailable: ${result.unavailable_checks.join(", ")}`] : []),
+        "",
+        ...result.results.map((item) =>
+          `- [${item.ok ? "PASS" : "FAIL"}] ${item.check}: ${item.command} (cwd=${item.cwd}, exit=${item.exit_code}, ${item.duration_ms} ms${item.output_truncated ? ", output truncated" : ""})`
+        )
+      ];
+      return textResult(lines.join("\n"), {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ...result,
+        bash_session_id: args.session_id ?? null
+      });
     }
   );
 
@@ -2261,6 +2679,7 @@ export function createCodexProServer(
         workspace_id: workspace.id,
         root: workspace.root,
         path: args.path ?? "workspace status",
+        ok: !statusError,
         status,
         status_error: statusError || undefined,
         changed_files: changedFiles,
@@ -2323,6 +2742,7 @@ export function createCodexProServer(
         workspace_id: workspace.id,
         root: workspace.root,
         path: args.path ?? "workspace diff",
+        ok: !diffError,
         staged,
         include_diff: includeDiff,
         diff_error: diffError || undefined,
@@ -2363,11 +2783,20 @@ export function createCodexProServer(
       const normalizedScopedPath = scopedPath?.trim() ? guard.resolve(workspace, scopedPath).relPath : undefined;
       const status = normalizeGitOutput(gitDiffStatus(config, guard, workspace, normalizedScopedPath, staged));
       const includeDiff = parseBool(args.include_diff, true);
-      const rawDiff = normalizeGitOutput(gitDiff(config, guard, workspace, normalizedScopedPath, staged));
+      let rawDiff = "";
+      let stats: { additions: number; deletions: number; changed: boolean };
+      let diffError = "";
+      if (includeDiff) {
+        rawDiff = normalizeGitOutput(gitDiff(config, guard, workspace, normalizedScopedPath, staged));
+        diffError = rawDiff && looksLikeGitError(rawDiff) ? rawDiff : "";
+        stats = diffError ? { additions: 0, deletions: 0, changed: false } : diffStats(rawDiff);
+      } else {
+        const statsOnly = readGitDiffStats(config, guard, workspace, normalizedScopedPath, staged);
+        diffError = statsOnly.error ?? "";
+        stats = { additions: statsOnly.additions, deletions: statsOnly.deletions, changed: statsOnly.changed };
+      }
       const statusError = looksLikeGitError(status) ? status : "";
-      const diffError = rawDiff && looksLikeGitError(rawDiff) ? rawDiff : "";
       const diff = diffError ? "" : rawDiff;
-      const stats = diffStats(diff);
       const changedFiles = statusError ? [] : changedStatusLines(status);
       const untrackedFingerprint = statusError ? "" : await untrackedReviewFingerprint(config, guard, workspace, changedFiles);
       const since = args.since === "workspace" ? "workspace" : "last_shown";
@@ -2378,7 +2807,9 @@ export function createCodexProServer(
       const checkpointWritten = markReviewed && includeDiff;
       if (checkpointWritten) reviewCheckpoints.set(checkpointKey, fingerprint);
       const responseDiff = checkpointHit ? "" : includeDiff ? diff : "";
-      const responseStats = checkpointHit ? { additions: 0, deletions: 0, changed: false } : stats;
+      const workspaceDirty = !statusError && !diffError && (changedFiles.length > 0 || stats.changed);
+      const newSinceReview = !checkpointHit && workspaceDirty;
+      const changesByRepository = repositoryChangeSummary(statusError ? "" : status, diff, includeDiff, checkpointHit);
       const changedPaths = statusError ? [] : changedPathsFromStatus(changedFiles);
       let analysis: Record<string, unknown> | undefined;
       if (config.analysisEnabled && changedPaths.length && !checkpointHit) {
@@ -2411,9 +2842,7 @@ export function createCodexProServer(
       }
       const changedText = statusError
         ? `- Git status unavailable: ${statusError}`
-        : checkpointHit
-          ? "- No changes since last shown review."
-          : changedFiles.length
+        : changedFiles.length
           ? changedFiles.map((line) => `- ${line}`).join("\n")
           : "- No changed files.";
       const diffText = checkpointHit
@@ -2428,21 +2857,29 @@ export function createCodexProServer(
       const analysisText = analysis
         ? `\n\n## Analysis\n\nAffected areas: ${(analysis.affected_areas as string[]).join(", ") || "none"}\nRisks: ${((analysis.risk_signals as Array<{ label?: string }>) ?? []).map((risk) => risk.label).filter(Boolean).join(", ") || "none"}\nRelated tests: ${((analysis.related_tests as Array<{ path?: string }>) ?? []).map((file) => file.path).filter(Boolean).join(", ") || "none"}`
         : "";
-      const text = `# Show Changes\n\nWorkspace: ${workspace.root}\n\n## Changed\n\n${changedText}\n\n## Diff stats\n\n+${responseStats.additions} -${responseStats.deletions}${diffText}${analysisText}`;
+      const reviewText = checkpointHit ? "\n\nReview checkpoint: no new diff since the last shown review." : "";
+      const text = `# Show Changes\n\nWorkspace: ${workspace.root}\n\n## Changed\n\n${changedText}\n\n## Diff stats\n\n+${stats.additions} -${stats.deletions}${reviewText}${diffText}${analysisText}`;
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
         path: args.path ?? "workspace changes",
+        ok: !statusError && !diffError,
         status,
         status_error: statusError || undefined,
         diff_error: diffError || undefined,
-        changed_files: checkpointHit ? [] : changedFiles,
+        changed_files: changedFiles,
+        current_changed_files: changedFiles,
+        new_changed_files: checkpointHit ? [] : changedFiles,
+        changes_by_repository: changesByRepository,
         staged,
         include_diff: includeDiff,
-        additions: responseStats.additions,
-        deletions: responseStats.deletions,
-        changed: !statusError && (checkpointHit ? false : changedFiles.length > 0 || responseStats.changed),
+        additions: stats.additions,
+        deletions: stats.deletions,
+        changed: workspaceDirty,
+        workspace_dirty: workspaceDirty,
+        new_since_review: newSinceReview,
         diff: responseDiff,
+        new_diff: responseDiff,
         review_since: since,
         review_marked: checkpointWritten,
         review_checkpoint_hit: checkpointHit,

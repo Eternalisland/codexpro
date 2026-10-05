@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added bounded multi-repository Git status and diff aggregation for non-Git workspace roots that contain independent child repositories.
+
 ## 0.30.3 (2026-10-01)
 
 - Fixed Windows handoff runs that could remain `running` after an npm `.cmd` executor exited by settling from the child exit when inherited output handles never close, terminating the full process tree on timeout, and recording the completion source for diagnostics.

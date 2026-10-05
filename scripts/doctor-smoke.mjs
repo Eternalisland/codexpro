@@ -78,7 +78,13 @@ const invalidDoctor = spawnSync(process.execPath, [
   '--root',
   invalidRoot,
   '--port',
-  String(await getFreePort())
+  String(await getFreePort()),
+  '--bash',
+  'banana',
+  '--write',
+  'banana',
+  '--tool-mode',
+  'banana'
 ], {
   cwd: path.resolve('.'),
   env: { ...process.env, CODEXPRO_HOME: home },

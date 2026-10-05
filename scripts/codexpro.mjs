@@ -393,7 +393,7 @@ function analysisChangedPaths(status) {
   const paths = [];
   for (const rawLine of String(status).split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || /^(fatal:|error:|git unavailable)/i.test(line)) continue;
+    if (!line || line.startsWith('##') || /^(fatal:|error:|git unavailable)/i.test(line)) continue;
     let filePath = '';
     if (line.startsWith('?? ')) filePath = line.slice(3).trim();
     else if (line.includes('\t')) filePath = line.split('\t').pop()?.trim() ?? '';

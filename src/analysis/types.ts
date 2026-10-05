@@ -160,6 +160,16 @@ export interface AnalysisCommandRecommendation {
   command: string;
   source: string;
   reasons: string[];
+  /** Stable verification category used by callers to select checks without parsing the command. */
+  check: string;
+  /** Working directory relative to the opened workspace. */
+  cwd?: string;
+  /** Nearest project root that owns the changed file. */
+  projectPath?: string;
+  /** Command runner, for example npm, pnpm, go, cargo, or python. */
+  runner?: string;
+  /** Whether the current CodexPro bash mode can run this command directly. */
+  runnable?: boolean;
 }
 
 export interface ChangeAnalysis {

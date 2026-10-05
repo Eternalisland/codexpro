@@ -9,12 +9,17 @@ process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = '1';
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const importBuilt = (relativePath) => import(pathToFileURL(path.join(projectRoot, 'dist', relativePath)).href);
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-analysis-'));
+const wideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-analysis-wide-'));
 const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-analysis-outside-'));
 
-async function write(relativePath, content) {
-  const target = path.join(tmp, relativePath);
+async function writeAt(root, relativePath, content) {
+  const target = path.join(root, relativePath);
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.writeFile(target, content, 'utf8');
+}
+
+async function write(relativePath, content) {
+  await writeAt(tmp, relativePath, content);
 }
 
 try {
@@ -40,6 +45,18 @@ try {
   await write('packages/core/src/index.ts', 'export function coreValue() { return 1; }\n');
   await write('packages/web/package.json', JSON.stringify({ name: '@fixture/web', dependencies: { '@fixture/core': 'workspace:*' } }, null, 2));
   await write('packages/web/src/index.ts', "import { coreValue } from '../../core/src/index.js';\nexport const webValue = coreValue();\n");
+  await writeAt(wideRoot, 'services/api/package.json', JSON.stringify({
+    name: '@fixture/api',
+    packageManager: 'npm@11.0.0',
+    scripts: { test: 'node --test', typecheck: 'tsc --noEmit' }
+  }, null, 2));
+  await writeAt(wideRoot, 'services/api/src/index.ts', 'export const apiReady = true;\n');
+  await writeAt(wideRoot, 'apps/web/package.json', JSON.stringify({
+    name: '@fixture/wide-web',
+    packageManager: 'pnpm@9.15.0',
+    scripts: { build: 'vite build', smoke: 'node smoke.mjs' }
+  }, null, 2));
+  await writeAt(wideRoot, 'apps/web/src/index.ts', 'export const webReady = true;\n');
   await fs.writeFile(path.join(outside, 'outside.ts'), 'export const outside = true;\n', 'utf8');
   let symlinkCreated = false;
   try {
@@ -124,8 +141,20 @@ try {
   assert(review.dependentFiles.some((file) => file.path === 'src/index.ts'));
   assert(review.relatedTests.some((file) => file.path === 'test/auth.test.ts'));
   assert(review.riskSignals.some((risk) => risk.id === 'authentication'));
-  assert(review.recommendedCommands.some((item) => item.command === 'pnpm test' && item.source === 'package.json'));
-  assert(review.recommendedCommands.some((item) => item.command === 'go test ./...' && item.source === 'go.mod'));
+  assert(review.recommendedCommands.some((item) => item.command === 'pnpm test' && item.source === 'package.json' && item.cwd === '.' && item.projectPath === '.' && item.check === 'test'));
+  assert(review.recommendedCommands.some((item) => item.command === 'go test ./...' && item.source === 'go.mod' && item.cwd === '.' && item.runner === 'go'));
+
+  const wideConfig = loadConfig(['--root', wideRoot, '--bash', 'safe', '--write', 'off']);
+  const wideGuard = new PathGuard(wideConfig);
+  const wideWorkspace = new WorkspaceManager(wideConfig).defaultWorkspace();
+  const wideChangedPaths = ['services/api/src/index.ts', 'apps/web/src/index.ts'];
+  const wideChecks = await analysisApi.discoverWorkspaceChecks(wideConfig, wideGuard, wideWorkspace, { changedPaths: wideChangedPaths });
+  assert(wideChecks.some((item) => item.command === 'npm test' && item.cwd === 'services/api' && item.projectPath === 'services/api' && item.runner === 'npm' && item.check === 'test' && item.runnable === true));
+  assert(wideChecks.some((item) => item.command === 'pnpm run build' && item.cwd === 'apps/web' && item.projectPath === 'apps/web' && item.runner === 'pnpm' && item.check === 'build' && item.runnable === true));
+  assert(wideChecks.some((item) => item.command === 'pnpm run smoke' && item.cwd === 'apps/web' && item.check === 'smoke' && item.runnable === true));
+  const wideReview = await analysisApi.reviewWorkspaceChanges(wideConfig, wideGuard, wideWorkspace, { changedPaths: wideChangedPaths });
+  assert(wideReview.recommendedCommands.some((item) => item.cwd === 'services/api'));
+  assert(wideReview.recommendedCommands.some((item) => item.cwd === 'apps/web'));
 
   const symbolLimitedConfig = {
     ...config,
@@ -177,5 +206,6 @@ try {
   console.log('✓ analysis smoke test passed');
 } finally {
   await fs.rm(tmp, { recursive: true, force: true });
+  await fs.rm(wideRoot, { recursive: true, force: true });
   await fs.rm(outside, { recursive: true, force: true });
 }

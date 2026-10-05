@@ -6,7 +6,7 @@ import { minimatch } from "minimatch";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
-import { hasSecretValue, redactSensitiveText } from "./redact.js";
+import { hasNewSecretValue, hasSecretValue, redactSensitiveText } from "./redact.js";
 
 export interface TreeOptions {
   path?: string;
@@ -348,6 +348,76 @@ export async function readTextFile(
   };
 }
 
+export interface ReadManyFileRequest {
+  path: string;
+  startLine?: number;
+  endLine?: number;
+  maxBytes?: number;
+}
+
+export interface ReadManyError {
+  path: string;
+  error: string;
+}
+
+export interface ReadManyResult {
+  results: ReadFileResult[];
+  errors: ReadManyError[];
+  totalTextBytes: number;
+  truncated: boolean;
+}
+
+export async function readManyTextFiles(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  files: ReadManyFileRequest[],
+  options: { maxBytesPerFile?: number; maxTotalBytes?: number; continueOnError?: boolean } = {}
+): Promise<ReadManyResult> {
+  const maxBytesPerFile = Math.max(
+    1_000,
+    Math.min(options.maxBytesPerFile ?? Math.min(config.maxReadBytes, 100_000), config.maxReadBytes)
+  );
+  const maxTotalBytes = Math.max(
+    1_000,
+    Math.min(options.maxTotalBytes ?? Math.min(config.maxReadBytes * 4, 500_000), 2_000_000)
+  );
+  // The aggregate budget prevents read_many from multiplying the single-file cap into an oversized MCP response.
+  const results: ReadFileResult[] = [];
+  const errors: ReadManyError[] = [];
+  let totalTextBytes = 0;
+  let truncated = false;
+
+  for (const request of files) {
+    try {
+      const result = await readTextFile(config, guard, workspace, request.path, {
+        startLine: request.startLine,
+        endLine: request.endLine,
+        maxBytes: Math.min(request.maxBytes ?? maxBytesPerFile, maxBytesPerFile)
+      });
+      const textBytes = Buffer.byteLength(result.text, "utf8");
+      if (totalTextBytes + textBytes > maxTotalBytes) {
+        truncated = true;
+        errors.push({
+          path: result.path,
+          error: `Aggregate read_many output limit reached (${maxTotalBytes} bytes).`
+        });
+        break;
+      }
+      totalTextBytes += textBytes;
+      results.push(result);
+    } catch (error) {
+      if (options.continueOnError === false) throw error;
+      errors.push({
+        path: request.path,
+        error: redactSensitiveText(error instanceof Error ? `${error.name}: ${error.message}` : String(error))
+      });
+    }
+  }
+
+  return { results, errors, totalTextBytes, truncated };
+}
+
 export async function writeTextFile(
   config: CodexProConfig,
   guard: PathGuard,
@@ -439,7 +509,7 @@ export async function editTextFile(
     if (afterBytes > config.maxWriteBytes) {
       throw new CodexProError(`Edited file would be too large (${afterBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
     }
-    if (hasSecretValue(after)) {
+    if (hasNewSecretValue(before, after)) {
       throw new CodexProError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
     }
 
