@@ -21,8 +21,10 @@ import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
 import { ManagedCheckManager } from "./checkJobOps.js";
 import { WorkspaceRegistry } from "./guard.js";
+import { ProtocolTraceManager, SseFrameInspector } from "./protocolTrace.js";
 import { redactConfigPaths } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
+import { consoleHeartbeatMs, logConsoleDiagnostic, withConsoleRequest } from "./consoleDiagnostics.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -30,6 +32,163 @@ function escapeHtml(value: unknown): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function captureBoundedResponse(
+  res: Response,
+  maxBytes: number,
+  onChunk?: (bytes: Buffer) => void
+): {
+  snapshot: () => { text: string; totalBytes: number };
+} {
+  let totalBytes = 0;
+  let retainedBytes = 0;
+  const chunks: Buffer[] = [];
+  const originalWrite = res.write.bind(res) as any;
+  const originalEnd = res.end.bind(res) as any;
+
+  const capture = (chunk: unknown, encoding?: BufferEncoding) => {
+    if (chunk === undefined || chunk === null) return;
+    let buffer: Buffer;
+    if (Buffer.isBuffer(chunk)) buffer = chunk;
+    else if (chunk instanceof Uint8Array) buffer = Buffer.from(chunk);
+    else buffer = Buffer.from(String(chunk), encoding ?? "utf8");
+    totalBytes += buffer.byteLength;
+    try { onChunk?.(buffer); } catch { /* tracing cannot affect HTTP writes */ }
+    const remaining = Math.max(0, maxBytes - retainedBytes);
+    if (remaining <= 0) return;
+    const retained = buffer.subarray(0, remaining);
+    chunks.push(retained);
+    retainedBytes += retained.byteLength;
+  };
+
+  (res as any).write = (chunk: unknown, ...args: any[]) => {
+    capture(chunk, typeof args[0] === "string" ? args[0] as BufferEncoding : undefined);
+    return originalWrite(chunk, ...args);
+  };
+  (res as any).end = (chunk?: unknown, ...args: any[]) => {
+    capture(chunk, typeof args[0] === "string" ? args[0] as BufferEncoding : undefined);
+    return originalEnd(chunk, ...args);
+  };
+
+  return {
+    snapshot: () => ({
+      text: Buffer.concat(chunks).toString("utf8"),
+      totalBytes
+    })
+  };
+}
+
+async function withMcpProtocolTrace(
+  trace: ProtocolTraceManager,
+  config: CodexProConfig,
+  req: Request,
+  res: Response,
+  sessionId: string | undefined,
+  fn: () => Promise<void>
+): Promise<void> {
+  if (!trace.enabled) {
+    await fn();
+    return;
+  }
+
+  const requestId =
+    (req as Request & { codexproRequestId?: string }).codexproRequestId ?? randomUUID();
+  const context = trace.createHttpContext({
+    requestId,
+    body: req.body,
+    sessionId,
+    httpMethod: req.method
+  });
+  let sseInspector: SseFrameInspector | undefined;
+  let sseSummaryRecorded = false;
+  const recordSseSummary = (reason: "finish" | "close" | "error") => {
+    if (sseSummaryRecorded) return;
+    if (!sseInspector) {
+      // An open SSE GET can stay silent until disconnect; still emit a zero-event summary.
+      const type = String(res.getHeader("content-type") ?? "").toLowerCase();
+      if (!type.includes("text/event-stream")) return;
+      sseInspector = new SseFrameInspector();
+    }
+    sseSummaryRecorded = true;
+    void trace.recordSse(context, "summary", {
+      ...sseInspector.snapshot(),
+      reason
+    }).catch(() => {});
+  };
+  const capture = captureBoundedResponse(res, config.mcpTraceMaxBodyBytes, (bytes) => {
+    const contentType = String(res.getHeader("content-type") ?? "").toLowerCase();
+    if (!contentType.includes("text/event-stream")) return;
+    sseInspector ??= new SseFrameInspector();
+    const frames = sseInspector.push(bytes);
+    const summary = sseInspector.snapshot();
+    // Log early chunks and logarithmic samples from long-lived SSE streams. Counters
+    // remain exact even when per-chunk/per-frame diagnostic records are sampled.
+    const sampled = (index: number) => index <= 32 || (index & (index - 1)) === 0;
+    if (sampled(summary.chunk_count)) {
+      void trace.recordSse(context, "chunk", {
+        chunk_index: summary.chunk_count,
+        chunk_bytes: bytes.byteLength,
+        total_bytes: summary.total_bytes,
+        frames_completed: frames.length
+      }).catch(() => {});
+    }
+    for (const frame of frames) {
+      if (sampled(frame.event_index)) {
+        void trace.recordSse(context, "event", { ...frame }).catch(() => {});
+      }
+    }
+  });
+  let responseFinished = false;
+  const recordLifecycle = (
+    event: "finish" | "close" | "error",
+    error?: unknown
+  ) => {
+    recordSseSummary(event);
+    const snapshot = capture.snapshot();
+    void trace.recordResponseLifecycle(context, event, {
+      statusCode: res.statusCode,
+      responseBytes: snapshot.totalBytes,
+      afterFinish: responseFinished || res.writableEnded,
+      writableEnded: res.writableEnded,
+      headersSent: res.headersSent,
+      requestAborted: req.aborted,
+      ...(error !== undefined ? { error } : {})
+    }).catch(() => {});
+  };
+  res.once("finish", () => {
+    responseFinished = true;
+    recordLifecycle("finish");
+  });
+  res.once("close", () => {
+    recordLifecycle("close");
+  });
+  res.once("error", (error) => {
+    recordLifecycle("error", error);
+  });
+  let requestBytes: number | undefined;
+  try {
+    requestBytes = Buffer.byteLength(JSON.stringify(req.body ?? null), "utf8");
+  } catch {}
+
+  await trace.run(context, async () => {
+    await trace.recordRequest(req.body, requestBytes);
+    try {
+      await fn();
+    } finally {
+      const snapshot = capture.snapshot();
+      let responseBody: unknown = snapshot.text;
+      try {
+        responseBody = snapshot.text ? JSON.parse(snapshot.text) : "";
+      } catch {}
+      await trace.recordResponse({
+        statusCode: res.statusCode,
+        body: responseBody,
+        responseBytes: snapshot.totalBytes,
+        isError: res.statusCode >= 400
+      });
+    }
+  });
 }
 
 function shellQuote(value: string): string {
@@ -1456,6 +1615,13 @@ async function main(): Promise<void> {
   }
 
   const app = express();
+  const protocolTrace = new ProtocolTraceManager({
+    mode: config.mcpTrace,
+    dir: config.mcpTraceDir,
+    maxBodyBytes: config.mcpTraceMaxBodyBytes,
+    maxFileBytes: config.mcpTraceMaxFileBytes,
+    retentionDays: config.mcpTraceRetentionDays
+  });
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
   const connectionDiagnostics = {
     server_started_at: new Date().toISOString(),
@@ -1549,15 +1715,44 @@ async function main(): Promise<void> {
       connectionDiagnostics.last_mcp_request_at = requestTime;
     }
     if (!logRequests) {
-      next();
+      withConsoleRequest(requestId, next);
       return;
     }
     const started = Date.now();
-    console.error(`[CodexPro] ${req.method} ${req.path} received request_id=${requestId}`);
-    res.on("finish", () => {
-      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms request_id=${requestId}`);
+    const streamHint = req.method === "GET" && req.path === "/mcp" ? " stream=sse" : "";
+    logConsoleDiagnostic(`[CodexPro] ${req.method} ${req.path} received request_id=${requestId}${streamHint}`);
+    let finished = false;
+    let closed = false;
+    const heartbeatMs = streamHint ? Math.max(30_000, consoleHeartbeatMs()) : consoleHeartbeatMs();
+    const progressTimer = setInterval(() => {
+      if (finished || closed) return;
+      logConsoleDiagnostic(
+        `[CodexPro] ${req.method} ${req.path} pending elapsed_ms=${Date.now() - started}` +
+        ` request_id=${requestId} headers_sent=${res.headersSent}${streamHint}`
+      );
+    }, heartbeatMs);
+    progressTimer.unref();
+    res.once("finish", () => {
+      finished = true;
+      clearInterval(progressTimer);
+      logConsoleDiagnostic(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms request_id=${requestId}`);
     });
-    next();
+    res.once("close", () => {
+      closed = true;
+      clearInterval(progressTimer);
+      // SSE GET normally remains open; close without finish records a client disconnect.
+      if (!finished) {
+        logConsoleDiagnostic(
+          `[CodexPro] ${req.method} ${req.path} closed elapsed_ms=${Date.now() - started}` +
+          ` request_id=${requestId} client_aborted=true${streamHint}`
+        );
+      }
+    });
+    res.once("error", () => {
+      clearInterval(progressTimer);
+      logConsoleDiagnostic(`[CodexPro] ${req.method} ${req.path} response_error elapsed_ms=${Date.now() - started} request_id=${requestId}`);
+    });
+    withConsoleRequest(requestId, next);
   });
   app.get("/favicon.ico", (_req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400");
@@ -1625,7 +1820,7 @@ async function main(): Promise<void> {
   const transports = new Map<string, TransportRecord>();
   const workspaceRegistry = new WorkspaceRegistry();
   // Managed checks outlive individual MCP transports so a reconnect can recover the same job.
-  const managedCheckManager = new ManagedCheckManager();
+  const managedCheckManager = new ManagedCheckManager(protocolTrace);
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   function requestSessionId(req: Request): string | undefined {
@@ -1704,6 +1899,11 @@ async function main(): Promise<void> {
       contextDir: config.contextDir,
       authEnabled: Boolean(config.authToken),
       authRequired: Boolean(config.authToken),
+      mcpTrace: config.mcpTrace,
+      mcpTraceDir: config.mcpTraceDir,
+      mcpTraceMaxBodyBytes: config.mcpTraceMaxBodyBytes,
+      mcpTraceMaxFileBytes: config.mcpTraceMaxFileBytes,
+      mcpTraceRetentionDays: config.mcpTraceRetentionDays,
       connection_diagnostics: connectionDiagnostics
     }, { labelUnknownPaths: true }));
   });
@@ -1738,6 +1938,7 @@ async function main(): Promise<void> {
   });
 
   app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+    await withMcpProtocolTrace(protocolTrace, config, req, res, requestSessionId(req), async () => {
     connectionDiagnostics.mcp_dispatches_started += 1;
     connectionDiagnostics.last_dispatch_started_at = new Date().toISOString();
     try {
@@ -1766,7 +1967,11 @@ async function main(): Promise<void> {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createCodexProServer(config, { workspaceRegistry, managedCheckManager });
+        const server = createCodexProServer(config, {
+          workspaceRegistry,
+          managedCheckManager,
+          protocolTraceManager: protocolTrace
+        });
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);
@@ -1787,6 +1992,7 @@ async function main(): Promise<void> {
         });
       }
     }
+    });
   });
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
@@ -1799,8 +2005,13 @@ async function main(): Promise<void> {
     await transport.handleRequest(req, res);
   };
 
-  app.get("/mcp", handleSessionRequest);
-  app.delete("/mcp", handleSessionRequest);
+  const tracedSessionRequest = async (req: Request, res: Response) => {
+    await withMcpProtocolTrace(protocolTrace, config, req, res, requestSessionId(req), async () => {
+      await handleSessionRequest(req, res);
+    });
+  };
+  app.get("/mcp", tracedSessionRequest);
+  app.delete("/mcp", tracedSessionRequest);
 
   app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
     if (!error || typeof error !== "object" || !("type" in error)) {
@@ -1836,7 +2047,7 @@ async function main(): Promise<void> {
     next(error);
   });
 
-  app.listen(config.port, config.host, () => {
+  const httpServer = app.listen(config.port, config.host, () => {
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
     console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
     console.error(`[CodexPro] allowedRoots=${config.allowedRoots.join(", ")}`);
@@ -1844,6 +2055,27 @@ async function main(): Promise<void> {
     console.error(`[CodexPro] writeMode=${config.writeMode}`);
     console.error(`[CodexPro] widgetDomain=${config.widgetDomain}`);
   });
+
+  let shuttingDown = false;
+  const shutdown = async (signal: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`[CodexPro] ${signal} received; stopping managed checks before shutdown.`);
+    clearInterval(pruneTimer);
+    for (const record of transports.values()) closeTransport(record);
+    transports.clear();
+    const checks = await managedCheckManager.shutdown(7_500);
+    if (!checks.settled) {
+      console.error("[CodexPro] managed check shutdown exceeded the grace period.");
+    }
+    await new Promise<void>((resolve) => {
+      httpServer.close(() => resolve());
+    });
+    process.exitCode = 0;
+  };
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+
 }
 
 main().catch((error) => {

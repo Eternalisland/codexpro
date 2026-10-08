@@ -147,6 +147,37 @@ codexpro start --headless
 CODEXPRO_TOOL_CARDS=1 codexpro start
 ```
 
+## MCP 请求、SSE 和执行时间线
+
+需要排查 ChatGPT 连接中断、MCP 超时或长时间静默的 `vue-tsc` 时，可以显式开启脱敏 Trace：
+
+```bash
+codexpro start --mcp-trace redacted
+codexpro trace tail --lines 30
+codexpro trace show --job check_xxx --json
+codexpro trace timeline --job check_xxx --html ./codexpro-timeline.html
+codexpro trace timeline --request req_xxx --json
+```
+
+用浏览器打开生成的本地 HTML 文件，即可按时间展开 HTTP、MCP、Tool、Execution Supervisor 和 SSE 事件。SSE 的 `mcp.sse.chunk`、`mcp.sse.event`、`mcp.sse.summary` 只记录分块大小、完整帧数和事件类型等元数据，不额外复制 `data:` 负载；长流对明细记录做采样，但最终计数保持完整。
+
+Trace 默认关闭。即使在 `redacted` 模式，日志仍可能包含文件路径、代码摘要、命令和业务信息，应只在可信设备保存和分享。离线 HTML 不加载脚本或外部资源；已存在的输出文件不会自动覆盖。HTTP `finish` 表示 Node 已完成响应写入，不表示 ChatGPT UI 一定收到或处理成功。
+
+### 控制台实时诊断（长时间无输出时建议开启）
+
+这与上方的 JSONL Trace 独立。Windows PowerShell 在启动 CodexPro 的同一个终端中设置：
+
+```powershell
+$env:CODEXPRO_LOG_REQUESTS = '1'
+$env:CODEXPRO_LOG_TOOL_CALLS = '1'
+$env:CODEXPRO_LOG_HEARTBEAT_MS = '10000'
+codexpro start --mcp-trace redacted
+```
+
+每条 MCP HTTP/Tool 控制台诊断都带 CodexPro 所在机器的本地时间和明确的 UTC 偏移（例如 `2026-10-08 22:32:50.123 +08:00`）；持久化 Protocol Trace JSONL 仍保留 UTC `Z` 时间戳，便于跨机器关联。Tool 在启动时打印 `start`，每隔 10 秒打印 `running elapsed_ms`，最后打印 `ok/error` 和总耗时。对于直接调用的 `bash`，实时输出 `pid`、`output_bytes`、`last_output_age_ms`；命令名称只对安全的 npm/pnpm/yarn/bun 验证脚本显示，其他命令显示 `custom-command`，不会原样打印脚本或凭证。可以通过 `request_id` 串联 HTTP 与 Tool 诊断。
+
+`GET /mcp received stream=sse` 通常表示**正常驻留的 SSE 连接**，每至少 30 秒报告一次待命；它没有立即返回 `200` 不代表卡死。`POST /mcp pending` 或 `[CodexProTool] bash running` 表示对应请求/命令仍在运行；`closed client_aborted=true` 表示响应未正常结束就关闭。建议长时间的 typecheck/build/test 使用 `start_check` + `wait_check`，不要让单次 `bash` MCP 调用阻塞几分钟。
+
 ## 公网 HTTPS
 
 ChatGPT Web 需要 HTTPS：

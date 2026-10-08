@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_ANALYSIS_LIMITS, type AnalysisLimits } from "./analysis/types.js";
+import type { ProtocolTraceMode } from "./protocolTrace.js";
 
 export type BashMode = "off" | "safe" | "full";
 export type BashTranscriptMode = "compact" | "full";
@@ -46,6 +47,11 @@ export interface CodexProConfig {
   toolCards: boolean;
   connectionTest: boolean;
   analysisEnabled: boolean;
+  mcpTrace: ProtocolTraceMode;
+  mcpTraceDir: string;
+  mcpTraceMaxBodyBytes: number;
+  mcpTraceMaxFileBytes: number;
+  mcpTraceRetentionDays: number;
   analysisLimits: AnalysisLimits;
 }
 
@@ -163,6 +169,11 @@ function numberFrom(value: string | undefined, fallback: number, min: number, ma
 function bashModeFrom(value: string | undefined): BashMode {
   if (value === "off" || value === "safe" || value === "full") return value;
   return "safe";
+}
+
+function protocolTraceModeFrom(value: string | undefined): ProtocolTraceMode {
+  if (value === "off" || value === "meta" || value === "redacted" || value === "full") return value;
+  return "off";
 }
 
 function bashTranscriptFrom(value: string | undefined): BashTranscriptMode {
@@ -296,6 +307,8 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
         : undefined;
   const writeArg = typeof args.write === "string" ? args.write : undefined;
   const toolModeArg = typeof args["tool-mode"] === "string" ? args["tool-mode"] : undefined;
+  const mcpTraceArg = typeof args["mcp-trace"] === "string" ? args["mcp-trace"] : undefined;
+  const mcpTraceDirArg = typeof args["mcp-trace-dir"] === "string" ? args["mcp-trace-dir"] : undefined;
   const widgetDomainArg = typeof args["widget-domain"] === "string" ? args["widget-domain"] : undefined;
   const toolCardsArg =
     args["tool-cards"] === true
@@ -319,6 +332,9 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     boolFrom(process.env.CODEXPRO_TUNNEL_MODE, false) ||
     (!isLoopbackHost(host) && !allowNoToken);
   const bashSessionId = bashSessionIdFrom(bashSessionArg ?? process.env.CODEXPRO_BASH_SESSION_ID);
+  const codexProHome = process.env.CODEXPRO_HOME
+    ? path.resolve(expandHome(process.env.CODEXPRO_HOME))
+    : path.join(os.homedir(), ".codexpro");
   const requireBashSession = boolFrom(requireBashSessionArg ?? process.env.CODEXPRO_REQUIRE_BASH_SESSION, false);
   if (requireBashSession && !bashSessionId) {
     throw new Error("CODEXPRO_REQUIRE_BASH_SESSION requires CODEXPRO_BASH_SESSION_ID or --bash-session.");
@@ -359,6 +375,11 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     toolCards: boolFrom(toolCardsArg ?? process.env.CODEXPRO_TOOL_CARDS, false),
     connectionTest: boolFrom(process.env.CODEXPRO_CONNECTION_TEST, false),
     analysisEnabled: boolFrom(process.env.CODEXPRO_ANALYSIS, true),
+    mcpTrace: protocolTraceModeFrom(mcpTraceArg ?? process.env.CODEXPRO_MCP_TRACE),
+    mcpTraceDir: path.resolve(expandHome(mcpTraceDirArg ?? process.env.CODEXPRO_MCP_TRACE_DIR ?? path.join(codexProHome, "traces"))),
+    mcpTraceMaxBodyBytes: numberFrom(process.env.CODEXPRO_MCP_TRACE_MAX_BODY_BYTES, 256 * 1024, 256, 10 * 1024 * 1024),
+    mcpTraceMaxFileBytes: numberFrom(process.env.CODEXPRO_MCP_TRACE_MAX_FILE_BYTES, 25 * 1024 * 1024, 64 * 1024, 512 * 1024 * 1024),
+    mcpTraceRetentionDays: numberFrom(process.env.CODEXPRO_MCP_TRACE_RETENTION_DAYS, 7, 1, 365),
     analysisLimits: {
       maxInventoryFiles: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES, DEFAULT_ANALYSIS_LIMITS.maxInventoryFiles, 100, 100_000),
       maxAnalyzedFiles: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_ANALYZED_FILES, DEFAULT_ANALYSIS_LIMITS.maxAnalyzedFiles, 10, 50_000),

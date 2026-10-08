@@ -9,6 +9,48 @@ import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
 import { redactSensitiveText } from "./redact.js";
 
+export interface BashProcessInfo {
+  pid: number;
+  processGroupId?: number;
+  startedAt: string;
+}
+
+export interface BashOutputEvent {
+  stream: "stdout" | "stderr";
+  text: string;
+  chunkBytes: number;
+  observedOutputBytes: number;
+  elapsedMs: number;
+}
+
+export interface BashRuntimeEvent {
+  pid?: number;
+  elapsedMs: number;
+  observedOutputBytes: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  lastOutputAt?: string;
+  lastOutputAgeMs?: number;
+  outputLimitExceeded: boolean;
+  timedOut: boolean;
+  cancelled: boolean;
+  terminationStarted: boolean;
+  childExited: boolean;
+  childExitElapsedMs?: number;
+}
+
+export interface BashRunOptions {
+  cwd?: string;
+  timeoutMs?: number;
+  sessionId?: string;
+  signal?: AbortSignal;
+  progressIntervalMs?: number;
+  onProcessStart?: (process: BashProcessInfo) => void | Promise<void>;
+  onProcessExit?: (process: BashProcessInfo) => void | Promise<void>;
+  onOutput?: (event: BashOutputEvent) => void | Promise<void>;
+  onProgress?: (event: BashRuntimeEvent) => void | Promise<void>;
+}
+
 export interface BashResult {
   command: string;
   cwd: string;
@@ -479,14 +521,52 @@ export function decodeBashOutput(
   }
 }
 
+function windowsDescendantPids(rootPid: number): number[] {
+  if (process.platform !== "win32" || !Number.isInteger(rootPid) || rootPid <= 0) return [];
+  const script = [
+    `$root=${rootPid}`,
+    "$items=Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId",
+    "$pending=@($root)",
+    "$seen=@{}",
+    "$out=@()",
+    "while($pending.Count -gt 0){$p=$pending[0];if($pending.Count -eq 1){$pending=@()}else{$pending=$pending[1..($pending.Count-1)]};foreach($x in $items){if($x.ParentProcessId -eq $p -and -not $seen.ContainsKey([string]$x.ProcessId)){$seen[[string]$x.ProcessId]=$true;$out+=@([int]$x.ProcessId);$pending+=@([int]$x.ProcessId)}}}",
+    "$out | ConvertTo-Json -Compress"
+  ].join(";");
+  try {
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 4_000,
+      windowsHide: true
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string" || !result.stdout.trim()) return [];
+    const parsed = JSON.parse(result.stdout);
+    const values = Array.isArray(parsed) ? parsed : [parsed];
+    return values
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0 && value !== rootPid);
+  } catch {
+    return [];
+  }
+}
+
 function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   if (!child.pid) return;
   if (process.platform === "win32") {
-    // Windows does not provide Unix-style cooperative signals to process trees.
-    // Force the full tree while the parent PID still identifies its descendants;
-    // otherwise the shell can exit first and orphan an output-heavy grandchild.
-    const args = ["/pid", String(child.pid), "/t", "/f"];
-    const result = spawnSync("taskkill", args, { stdio: "ignore", windowsHide: true });
+    // Snapshot descendants before killing the root. Git Bash/npm can let descendants outlive
+    // the shell long enough to keep inherited stdout/stderr pipes open, delaying "close".
+    // Kill deepest descendants first, then the root tree.
+    const descendants = windowsDescendantPids(child.pid).reverse();
+    for (const pid of descendants) {
+      spawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true
+      });
+    }
+    const result = spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true
+    });
     if (result.status !== 0) child.kill(signal);
     return;
   }
@@ -502,7 +582,7 @@ export async function runBash(
   guard: PathGuard,
   workspace: Workspace,
   command: string,
-  options: { cwd?: string; timeoutMs?: number; sessionId?: string; signal?: AbortSignal } = {}
+  options: BashRunOptions = {}
 ): Promise<BashResult> {
   if (!command?.trim()) throw new CodexProError("command is required.");
   const bashSessionId = assertBashSession(config, options.sessionId);
@@ -539,12 +619,29 @@ export async function runBash(
       cwd,
       env: makeEnv(config),
       stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
+      // Give every verification shell its own process group. This makes crash ownership explicit
+      // on every platform while timeout/cancel still terminate the full tree via terminateProcessTree().
+      detached: true,
       windowsHide: true
     });
 
+    // Surface the shell PID/process-group to managed checks so restart recovery can distinguish
+    // a dead validation from one that is still running after the CodexPro parent disappears.
+    const processInfo: BashProcessInfo | undefined = child.pid
+      ? {
+          pid: child.pid,
+          ...(process.platform !== "win32" ? { processGroupId: child.pid } : {}),
+          startedAt: new Date().toISOString()
+        }
+      : undefined;
+    if (processInfo) void Promise.resolve(options.onProcessStart?.(processInfo)).catch(() => {});
+
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
+    let stdoutPending = Buffer.alloc(0);
+    let stderrPending = Buffer.alloc(0);
+    let liveOutputBytes = 0;
+    let liveOutputSuppressed = false;
     let killedByTimeout = false;
     let killedByAbort = false;
     let outputLimitExceeded = false;
@@ -552,6 +649,11 @@ export async function runBash(
     let terminationStarted = false;
     let killTimer: NodeJS.Timeout | undefined;
     let observedOutputBytes = 0;
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let lastOutputAtMs: number | undefined;
+    let childExited = false;
+    let childExitElapsedMs: number | undefined;
     const retainedOutputBytes = config.maxOutputBytes;
 
     const terminate = (signal: NodeJS.Signals) => {
@@ -568,8 +670,6 @@ export async function runBash(
     // Output limits bound what MCP retains; they must not terminate a test whose exit code is still needed for diagnosis.
     let retainedBytes = 0;
     const appendBounded = (chunks: Buffer[], chunk: Buffer) => {
-      observedOutputBytes += chunk.byteLength;
-      if (observedOutputBytes > config.maxOutputBytes) outputLimitExceeded = true;
       const remaining = retainedOutputBytes - retainedBytes;
       if (remaining <= 0) return;
       const retained = chunk.subarray(0, remaining);
@@ -577,31 +677,143 @@ export async function runBash(
       retainedBytes += retained.byteLength;
     };
 
+    const emitLiveLine = (stream: "stdout" | "stderr", line: Buffer) => {
+      if (!options.onOutput || liveOutputSuppressed || line.length === 0) return;
+      if (liveOutputBytes + line.byteLength > retainedOutputBytes) {
+        liveOutputSuppressed = true;
+        return;
+      }
+      liveOutputBytes += line.byteLength;
+      const text = redactSensitiveText(decodeBashOutput(line, process.platform, false));
+      if (!text) return;
+      void Promise.resolve(
+        options.onOutput({
+          stream,
+          text,
+          chunkBytes: line.byteLength,
+          observedOutputBytes,
+          elapsedMs: Date.now() - start
+        })
+      ).catch(() => {});
+    };
+
+    // Keep a whole line until redaction so a token split across stdout chunks is never emitted piecemeal.
+    const processLiveChunk = (stream: "stdout" | "stderr", chunk: Buffer, flush = false) => {
+      if (!options.onOutput || liveOutputSuppressed) return;
+      let pending = Buffer.concat([stream === "stdout" ? stdoutPending : stderrPending, chunk]);
+      let offset = 0;
+      while (true) {
+        const newline = pending.indexOf(0x0a, offset);
+        if (newline < 0) break;
+        emitLiveLine(stream, pending.subarray(offset, newline + 1));
+        offset = newline + 1;
+        if (liveOutputSuppressed) break;
+      }
+      pending = liveOutputSuppressed ? Buffer.alloc(0) : pending.subarray(offset);
+      if (flush && pending.length > 0) {
+        emitLiveLine(stream, pending);
+        pending = Buffer.alloc(0);
+      } else if (pending.length > retainedOutputBytes) {
+        // An extremely long unterminated line cannot be safely redacted incrementally.
+        liveOutputSuppressed = true;
+        pending = Buffer.alloc(0);
+      }
+      if (stream === "stdout") stdoutPending = pending;
+      else stderrPending = pending;
+    };
+
+    const observeChunk = (stream: "stdout" | "stderr", chunks: Buffer[], chunk: Buffer) => {
+      observedOutputBytes += chunk.byteLength;
+      if (stream === "stdout") stdoutBytes += chunk.byteLength;
+      else stderrBytes += chunk.byteLength;
+      lastOutputAtMs = Date.now();
+      if (observedOutputBytes > config.maxOutputBytes) outputLimitExceeded = true;
+      appendBounded(chunks, chunk);
+      processLiveChunk(stream, chunk);
+    };
+
+    const emitProgress = () => {
+      if (!options.onProgress) return;
+      const now = Date.now();
+      void Promise.resolve(
+        options.onProgress({
+          ...(processInfo?.pid ? { pid: processInfo.pid } : {}),
+          elapsedMs: now - start,
+          observedOutputBytes,
+          stdoutBytes,
+          stderrBytes,
+          ...(lastOutputAtMs
+            ? {
+                lastOutputAt: new Date(lastOutputAtMs).toISOString(),
+                lastOutputAgeMs: Math.max(0, now - lastOutputAtMs)
+              }
+            : {}),
+          outputLimitExceeded,
+          timedOut: killedByTimeout,
+          cancelled: killedByAbort,
+          terminationStarted,
+          childExited,
+          ...(childExitElapsedMs !== undefined ? { childExitElapsedMs } : {})
+        })
+      ).catch(() => {});
+    };
+    const progressIntervalMs = Math.max(1_000, Math.min(options.progressIntervalMs ?? 5_000, 30_000));
+    const progressTimer = options.onProgress ? setInterval(emitProgress, progressIntervalMs) : undefined;
+    progressTimer?.unref();
+
     const timer = setTimeout(() => {
       killedByTimeout = true;
       terminateWithEscalation();
+      emitProgress();
     }, timeoutMs);
     timer.unref();
     const abort = () => {
       killedByAbort = true;
       terminateWithEscalation();
+      emitProgress();
     };
     options.signal?.addEventListener("abort", abort, { once: true });
 
     child.stdout.on("data", (chunk) => {
-      appendBounded(stdoutChunks, Buffer.from(chunk));
+      observeChunk("stdout", stdoutChunks, Buffer.from(chunk));
     });
     child.stderr.on("data", (chunk) => {
-      appendBounded(stderrChunks, Buffer.from(chunk));
+      observeChunk("stderr", stderrChunks, Buffer.from(chunk));
+    });
+    child.on("exit", () => {
+      childExited = true;
+      childExitElapsedMs = Date.now() - start;
+      emitProgress();
+
+      if (terminationStarted) {
+        // On Windows/Git Bash a terminated shell can exit while a descendant still holds an
+        // inherited stdout/stderr handle. Waiting for Node's "close" would then block until that
+        // descendant exits naturally. The command is already timed out/cancelled, so flush what
+        // we have and close our pipe ends after the process-tree termination attempt.
+        processLiveChunk("stdout", Buffer.alloc(0), true);
+        processLiveChunk("stderr", Buffer.alloc(0), true);
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
     });
     child.on("error", (error) => {
       closed = true;
+      processLiveChunk("stdout", Buffer.alloc(0), true);
+      processLiveChunk("stderr", Buffer.alloc(0), true);
+      if (progressTimer) clearInterval(progressTimer);
+      if (processInfo) void Promise.resolve(options.onProcessExit?.(processInfo)).catch(() => {});
       options.signal?.removeEventListener("abort", abort);
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
       reject(error);
     });
     child.on("close", (exitCode, signal) => {
+      processLiveChunk("stdout", Buffer.alloc(0), true);
+      processLiveChunk("stderr", Buffer.alloc(0), true);
+      emitProgress();
+      if (progressTimer) clearInterval(progressTimer);
+      // Clear persisted process ownership as soon as the controlled shell exits.
+      if (processInfo) void Promise.resolve(options.onProcessExit?.(processInfo)).catch(() => {});
       closed = true;
       options.signal?.removeEventListener("abort", abort);
       clearTimeout(timer);

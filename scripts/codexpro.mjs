@@ -15,6 +15,7 @@ import {
   readCloudflaredAssetResponse,
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
+import { runTraceCli } from './trace-cli.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UNTRACKED_FILE_HASH_BYTES = 64 * 1024;
@@ -38,6 +39,11 @@ Usage:
   codexpro start --root /path/to/repo
   codexpro settings
   codexpro doctor
+  codexpro trace tail
+  codexpro trace show --last
+  codexpro trace show --request <request_id>
+  codexpro trace show --job <job_id>
+  codexpro trace timeline --job <job_id> --html ./trace-timeline.html
   codexpro connection-test --root /path/to/repo
   codexpro inspect --root /path/to/repo [--json]
   codexpro review --root /path/to/repo [--staged] [--path src/file.ts] [--json]
@@ -97,6 +103,15 @@ Options:
   --widget-domain <origin>   Dedicated HTTPS origin for ChatGPT widget iframes.
                              Required for app submission. Default: https://rebel0789.github.io.
   --tool-cards <on|off>      Opt in to ChatGPT widget metadata on tool descriptors. Default: off.
+  --mcp-trace <off|meta|redacted|full>
+                             MCP protocol trace mode. Default: off.
+  --mcp-trace-dir <dir>      JSONL trace directory. Default: ~/.codexpro/traces.
+  --mcp-trace-max-body-bytes <n>
+                             Max retained request/response/tool payload bytes. Default: 262144.
+  --mcp-trace-max-file-bytes <n>
+                             Rotate JSONL after this many bytes. Default: 26214400.
+  --mcp-trace-retention-days <n>
+                             Delete old trace files after N days. Default: 7.
   --tunnel <none|cloudflare|cloudflare-named|ngrok|tailscale>
                              Expose local MCP. Default: cloudflare.
                              cloudflare = quick tunnel with a new URL each restart.
@@ -3983,6 +3998,10 @@ async function main() {
     await runAnalysisCli(subcommand, argv.slice(1));
     return;
   }
+  if (subcommand === 'trace') {
+    await runTraceCli(argv.slice(1));
+    return;
+  }
   if (subcommand === 'stable-help') {
     printStableUrlHelp();
     return;
@@ -4124,12 +4143,24 @@ async function main() {
   const toolMode = optionValue(args, profile, 'toolMode', ['CODEXPRO_TOOL_MODE'], 'standard');
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['CODEXPRO_WIDGET_DOMAIN'], 'https://rebel0789.github.io');
   const toolCards = optionBool(args, profile, 'toolCards', ['CODEXPRO_TOOL_CARDS'], false);
+  const mcpTrace = optionValue(args, profile, 'mcpTrace', ['CODEXPRO_MCP_TRACE'], 'off');
+  const mcpTraceDir = optionValue(args, profile, 'mcpTraceDir', ['CODEXPRO_MCP_TRACE_DIR'], '');
+  const mcpTraceMaxBodyBytes = optionValue(args, profile, 'mcpTraceMaxBodyBytes', ['CODEXPRO_MCP_TRACE_MAX_BODY_BYTES'], '');
+  const mcpTraceMaxFileBytes = optionValue(args, profile, 'mcpTraceMaxFileBytes', ['CODEXPRO_MCP_TRACE_MAX_FILE_BYTES'], '');
+  const mcpTraceRetentionDays = optionValue(args, profile, 'mcpTraceRetentionDays', ['CODEXPRO_MCP_TRACE_RETENTION_DAYS'], '');
+  const expandedTraceDir = mcpTraceDir ? expandHome(String(mcpTraceDir)) : '';
+  const resolvedTraceDir = expandedTraceDir
+    ? path.isAbsolute(expandedTraceDir)
+      ? path.resolve(expandedTraceDir)
+      : path.resolve(root, expandedTraceDir)
+    : '';
   validateChoice('bash', bash, ['off', 'safe', 'full']);
   if (bashRuntime === 'wsl' && process.platform !== 'win32') {
     throw new Error('--bash-runtime=wsl is only supported on Windows.');
   }
   validateChoice('write', write, ['off', 'handoff', 'workspace']);
   validateChoice('tool-mode', toolMode, ['minimal', 'standard', 'full']);
+  validateChoice('mcp-trace', mcpTrace, ['off', 'meta', 'redacted', 'full']);
 
   if (args.token && args.tokenFile) throw new Error('Use either --token or --token-file, not both.');
   let token = args.noAuth
@@ -4157,12 +4188,17 @@ async function main() {
     CODEXPRO_TOOL_MODE: toolMode,
     CODEXPRO_WIDGET_DOMAIN: widgetDomain,
     CODEXPRO_TOOL_CARDS: toolCards ? '1' : '0',
+    CODEXPRO_MCP_TRACE: mcpTrace,
     CODEXPRO_CONNECTION_TEST: connectionTest ? '1' : '0',
     CODEXPRO_MODE: mode,
     CODEXPRO_TUNNEL_MODE: tunnel === 'none' ? '0' : '1',
     CODEXPRO_ALLOW_NO_HTTP_TOKEN: args.noAuth ? '1' : '0'
   };
   if (codexDir) serverEnv.CODEXPRO_CODEX_DIR = codexDir;
+  if (resolvedTraceDir) serverEnv.CODEXPRO_MCP_TRACE_DIR = resolvedTraceDir;
+  if (mcpTraceMaxBodyBytes) serverEnv.CODEXPRO_MCP_TRACE_MAX_BODY_BYTES = String(mcpTraceMaxBodyBytes);
+  if (mcpTraceMaxFileBytes) serverEnv.CODEXPRO_MCP_TRACE_MAX_FILE_BYTES = String(mcpTraceMaxFileBytes);
+  if (mcpTraceRetentionDays) serverEnv.CODEXPRO_MCP_TRACE_RETENTION_DAYS = String(mcpTraceRetentionDays);
   if (args.logRequests || process.env.CODEXPRO_LOG_REQUESTS === '1') serverEnv.CODEXPRO_LOG_REQUESTS = '1';
   if (args.allowHome) serverEnv.CODEXPRO_ALLOW_HOME = '1';
   if (token) serverEnv.CODEXPRO_HTTP_TOKEN = token;
@@ -4186,6 +4222,7 @@ async function main() {
     labelValue('Bash transcript', bashTranscript),
     labelValue('Bash runtime', `${bashRuntime}${bashExecutable ? ` (${bashExecutable})` : ''}`),
     labelValue('Codex sessions', codexSessions),
+    labelValue('MCP trace', mcpTrace === 'off' ? 'off' : `${mcpTrace} -> ${resolvedTraceDir || '~/.codexpro/traces'}`),
     ...(bashSession ? [labelValue('Bash session', `${bashSession}${requireBashSession ? ' required' : ''}`)] : []),
     labelValue('Local URL', `http://${host}:${port}/mcp`),
     labelValue(

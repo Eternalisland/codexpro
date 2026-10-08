@@ -137,6 +137,34 @@ Opt-in tool cards:
 CODEXPRO_TOOL_CARDS=1 codexpro start
 ```
 
+## MCP request, SSE and execution timeline
+
+For diagnosing ChatGPT disconnects, MCP timeouts or silent long-running checks such as `vue-tsc`, explicitly enable redacted tracing:
+
+```bash
+codexpro start --mcp-trace redacted
+codexpro trace tail --lines 30
+codexpro trace show --job check_xxx --json
+codexpro trace timeline --job check_xxx --html ./codexpro-timeline.html
+codexpro trace timeline --request req_xxx --json
+```
+
+Open the resulting offline HTML in a browser for an expandable, time-aligned view of HTTP, MCP, tool, execution and SSE events. SSE `mcp.sse.chunk`, `mcp.sse.event`, and `mcp.sse.summary` retain metadata (byte counts, frames and event types), not raw `data:` payloads. Very long streams sample detailed events while keeping complete aggregate counts.
+
+Tracing is off by default. Even redacted traces may contain source previews, paths, commands and business information. Keep exported files private. The viewer contains no scripts or external dependencies and never overwrites an existing file. HTTP `finish` means Node completed its response write, not necessarily that ChatGPT received or processed it.
+
+### Live console diagnostics (recommended for silent long-running requests)
+
+This is independent of JSONL tracing. In the terminal starting CodexPro, enable:
+
+```bash
+CODEXPRO_LOG_REQUESTS=1 CODEXPRO_LOG_TOOL_CALLS=1 CODEXPRO_LOG_HEARTBEAT_MS=10000 codexpro start --mcp-trace redacted
+```
+
+HTTP and tool console messages use the CodexPro host's local time with an explicit UTC offset (for example, `2026-10-08 22:32:50.123 +08:00`). Persisted Protocol Trace JSONL continues to use UTC timestamps ending in `Z` for cross-machine correlation. A tool logs `start`, `running elapsed_ms` every 10 seconds, then `ok/error` with its final duration. Direct `bash` calls also expose PID, cumulative output bytes and last-output age. Only recognized npm/pnpm/yarn/bun verification script names appear; all other commands are labeled `custom-command` instead of echoing arbitrary shell content or credentials. Match HTTP and tool messages by `request_id`.
+
+`GET /mcp received stream=sse` is usually a **normal long-lived SSE connection**, and not receiving an immediate HTTP completion log is expected. The logger prints periodic idle heartbeats (at least 30 seconds apart). `POST /mcp pending` and `bash running` identify active work; `closed client_aborted=true` identifies a response closed before normal completion. For long typechecks, builds and test suites, use `start_check` and poll `wait_check` instead of keeping one synchronous `bash` MCP request open for minutes.
+
 ## Public HTTPS options
 
 ChatGPT web needs HTTPS:

@@ -606,6 +606,12 @@ try {
     if (recovered.structuredContent.job_id !== startedJob) {
       throw new Error(`new HTTP session could not recover the previous job: ${JSON.stringify(recovered.structuredContent)}`);
     }
+    if (
+      recovered.structuredContent.runner_lease?.active !== true ||
+      recovered.structuredContent.runner_lease?.owned_by_current_process !== true
+    ) {
+      throw new Error(`HTTP reconnect lost the in-process runner lease: ${JSON.stringify(recovered.structuredContent)}`);
+    }
 
     const retried = await callTool(reconnectedClient, 'start_check', {
       request_id: resumableRequestId,

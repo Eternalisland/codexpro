@@ -2,6 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
 import { createCodexProServer } from "./server.js";
+import { ManagedCheckManager } from "./checkJobOps.js";
 import { CODEXPRO_VERSION } from "./version.js";
 
 function printHelp(): void {
@@ -28,8 +29,23 @@ async function main(): Promise<void> {
 
   process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN ??= "1";
   const config = loadConfig();
-  const server = createCodexProServer(config);
+  const managedCheckManager = new ManagedCheckManager();
+  const server = createCodexProServer(config, { managedCheckManager });
   const transport = new StdioServerTransport();
+  let shuttingDown = false;
+  const shutdown = async (signal: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`[CodexPro] ${signal} received; stopping managed checks before shutdown.`);
+    const checks = await managedCheckManager.shutdown(7_500);
+    if (!checks.settled) {
+      console.error("[CodexPro] managed check shutdown exceeded the grace period.");
+      process.exit(1);
+    }
+    process.exit(0);
+  };
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
   await server.connect(transport);
 }
 

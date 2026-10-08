@@ -5,8 +5,21 @@ import type { CodexProConfig } from "./config.js";
 import type { PathGuard, Workspace } from "./guard.js";
 import { discoverWorkspaceChecks } from "./analysis/index.js";
 import type { AnalysisCommandRecommendation } from "./analysis/types.js";
-import { runBash } from "./bashOps.js";
+import { runBash, type BashOutputEvent, type BashProcessInfo, type BashRuntimeEvent } from "./bashOps.js";
 import { gitDiff, gitDiffStatus } from "./gitOps.js";
+
+export type RunChecksPhase =
+  | "discovering_checks"
+  | "fingerprinting_before"
+  | "fingerprint_before_reused"
+  | "running_checks"
+  | "fingerprinting_after"
+  | "finished";
+
+export interface RunChecksPhaseEvent {
+  phase: RunChecksPhase;
+  elapsedMs: number;
+}
 
 export interface RunChecksOptions {
   projectPath?: string;
@@ -16,7 +29,14 @@ export interface RunChecksOptions {
   sessionId?: string;
   stopOnFailure?: boolean;
   signal?: AbortSignal;
+  initialWorkspaceFingerprint?: string;
+  onPhase?: (event: RunChecksPhaseEvent) => void | Promise<void>;
   onResult?: (result: CheckResult, index: number) => void;
+  progressIntervalMs?: number;
+  onProcessStart?: (process: BashProcessInfo, index: number, recommendation: AnalysisCommandRecommendation) => void | Promise<void>;
+  onProcessExit?: (process: BashProcessInfo, index: number, recommendation: AnalysisCommandRecommendation) => void | Promise<void>;
+  onOutput?: (event: BashOutputEvent, index: number, recommendation: AnalysisCommandRecommendation) => void | Promise<void>;
+  onProgress?: (event: BashRuntimeEvent, index: number, recommendation: AnalysisCommandRecommendation) => void | Promise<void>;
 }
 
 export interface CheckFailure {
@@ -257,23 +277,42 @@ export async function runWorkspaceChecks(
   workspace: Workspace,
   options: RunChecksOptions
 ): Promise<RunChecksResult> {
+  const startedAt = Date.now();
+  const emitPhase = async (phase: RunChecksPhase) => {
+    await Promise.resolve(options.onPhase?.({ phase, elapsedMs: Date.now() - startedAt }));
+  };
   const requestedChecks = [...new Set(options.checks.map((check) => check.trim()).filter(Boolean))];
   const projectPath = normalizedProjectPath(guard, workspace, options.projectPath);
   const targetPaths = normalizedTargetPaths(guard, workspace, options.targetPaths);
+  await emitPhase("discovering_checks");
   const recommendations = await discoverWorkspaceChecks(config, guard, workspace, { changedPaths: targetPaths });
   const scoped = projectPath
     ? recommendations.filter((recommendation) => projectKey(recommendation) === projectPath)
     : recommendations;
   const { selected, unavailable } = selectRecommendations(scoped, requestedChecks);
 
-  const before = await workspaceFingerprint(config, guard, workspace);
+  let before: string;
+  if (options.initialWorkspaceFingerprint) {
+    await emitPhase("fingerprint_before_reused");
+    before = options.initialWorkspaceFingerprint;
+  } else {
+    await emitPhase("fingerprinting_before");
+    before = await workspaceFingerprint(config, guard, workspace);
+  }
+  await emitPhase("running_checks");
   const results: CheckResult[] = [];
   for (const recommendation of selected) {
+    const resultIndex = results.length;
     const result = await runBash(config, guard, workspace, recommendation.command, {
       cwd: recommendation.cwd ?? ".",
       timeoutMs: options.timeoutMs,
       sessionId: options.sessionId,
-      signal: options.signal
+      signal: options.signal,
+      progressIntervalMs: options.progressIntervalMs,
+      onProcessStart: (process) => options.onProcessStart?.(process, resultIndex, recommendation),
+      onProcessExit: (process) => options.onProcessExit?.(process, resultIndex, recommendation),
+      onOutput: (event) => options.onOutput?.(event, resultIndex, recommendation),
+      onProgress: (event) => options.onProgress?.(event, resultIndex, recommendation)
     });
     const combinedOutput = `${result.stdout}\n${result.stderr}`;
     const checkResult: CheckResult = {
@@ -302,7 +341,9 @@ export async function runWorkspaceChecks(
     options.onResult?.(checkResult, results.length - 1);
     if (result.cancelled || (!result.ok && options.stopOnFailure)) break;
   }
+  await emitPhase("fingerprinting_after");
   const after = await workspaceFingerprint(config, guard, workspace);
+  await emitPhase("finished");
 
   return {
     ok: selected.length > 0 && unavailable.length === 0 && results.every((result) => result.ok),
