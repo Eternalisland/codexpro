@@ -155,11 +155,24 @@ CODEXPRO_TOOL_CARDS=1 codexpro start
 codexpro start --mcp-trace redacted
 codexpro trace tail --lines 30
 codexpro trace show --job check_xxx --json
-codexpro trace timeline --job check_xxx --html ./codexpro-timeline.html
+codexpro trace timeline --last --html ./codexpro-timeline.html
+codexpro trace timeline --job check_xxx --html ./codexpro-job-timeline.html
+codexpro trace timeline --trace-id tr_xxx --html ./codexpro-change-timeline.html
 codexpro trace timeline --request req_xxx --json
 ```
 
-用浏览器打开生成的本地 HTML 文件，即可按时间展开 HTTP、MCP、Tool、Execution Supervisor 和 SSE 事件。SSE 的 `mcp.sse.chunk`、`mcp.sse.event`、`mcp.sse.summary` 只记录分块大小、完整帧数和事件类型等元数据，不额外复制 `data:` 负载；长流对明细记录做采样，但最终计数保持完整。
+**实时查看（推荐）**：在运行 `codexpro start --mcp-trace redacted` 的终端出现 `codexpro>` 后，直接按 **`t`**，即可启动仅监听 `127.0.0.1` 的 Trace Explorer 并自动在本机浏览器打开。再次按 `t` 会重新打开同一个页面。终端中已有的 Enter / c / o / q 快捷键不变；`q` 停止 CodexPro 时查看器也随进程退出。
+
+也可以在另一个终端独立启动（支持无日志文件时等待后续事件）：
+
+```bash
+codexpro trace explorer
+codexpro trace explorer --trace-dir ~/.codexpro/traces --no-open
+```
+
+实时页面默认打开「文件变更」标签：左侧按文件聚合，按最近修改排序；中间以纵向修改记录浏览每一次操作；右侧提供同步对齐的 Before/After Diff。需要排查 MCP/HTTP/SSE 调用时可切换至「协议事件」标签。顶部保留全局搜索，项目（workspace ID）、开始/结束时间、工具及文件路径放在可展开的筛选面板中。选择同一文件的某次修改，点击「上一次 / 下一次」逐步查看代码 Diff；展开「比较多个修改步骤」后可选择起止记录，按时间顺序展示多次 Patch。每一步记录的是操作级差异，**不是完整文件快照，也不保证能计算任意两个历史版本的最终净差异**；多文件 `apply_patch` 仍展示整个 Patch。浏览器通过本地 SSE 接收变更提醒；不会把查看器挂载到公网 MCP 服务或隧道。查看器地址包含随机访问令牌，请勿转发；进程重启后地址会变化。Trace 默认关闭，若未开启记录只能查看已存在的日志。
+
+**离线导出**：用浏览器打开生成的本地 HTML 文件，即可按时间展开 HTTP、MCP、Tool、Execution Supervisor 和 SSE 事件。页面顶部的 **Change history** 汇总选定 Trace 中 `write`、`edit`、`apply_patch` 成功操作产生的文件变更，展开后可以查看代码修改前后的左右对比，并通过 `span_id` 找到对应的工具调用。旧 Trace 在保留了完整工具返回值时也可展示差异；`meta` 模式只保留变更元数据，截断的 Patch 只显示预览，不应当作完整历史。SSE 的 `mcp.sse.chunk`、`mcp.sse.event`、`mcp.sse.summary` 只记录分块大小、完整帧数和事件类型等元数据，不额外复制 `data:` 负载；长流对明细记录做采样，但最终计数保持完整。
 
 Trace 默认关闭。即使在 `redacted` 模式，日志仍可能包含文件路径、代码摘要、命令和业务信息，应只在可信设备保存和分享。离线 HTML 不加载脚本或外部资源；已存在的输出文件不会自动覆盖。HTTP `finish` 表示 Node 已完成响应写入，不表示 ChatGPT UI 一定收到或处理成功。
 

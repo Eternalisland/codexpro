@@ -26,6 +26,11 @@ import { redactConfigPaths } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { consoleHeartbeatMs, logConsoleDiagnostic, withConsoleRequest } from "./consoleDiagnostics.js";
 
+/**
+ * V100(20261019) yijiakang 【可靠性修复】隔离 HTTP Trace 诊断故障，任务号:20260509145520000648
+ */
+const verNum = "V100(20261019)";
+
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -111,10 +116,11 @@ async function withMcpProtocolTrace(
       sseInspector = new SseFrameInspector();
     }
     sseSummaryRecorded = true;
-    void trace.recordSse(context, "summary", {
-      ...sseInspector.snapshot(),
+    const summary = sseInspector.snapshot();
+    void trace.bestEffort(() => trace.recordSse(context, "summary", {
+      ...summary,
       reason
-    }).catch(() => {});
+    }));
   };
   const capture = captureBoundedResponse(res, config.mcpTraceMaxBodyBytes, (bytes) => {
     const contentType = String(res.getHeader("content-type") ?? "").toLowerCase();
@@ -126,16 +132,16 @@ async function withMcpProtocolTrace(
     // remain exact even when per-chunk/per-frame diagnostic records are sampled.
     const sampled = (index: number) => index <= 32 || (index & (index - 1)) === 0;
     if (sampled(summary.chunk_count)) {
-      void trace.recordSse(context, "chunk", {
+      void trace.bestEffort(() => trace.recordSse(context, "chunk", {
         chunk_index: summary.chunk_count,
         chunk_bytes: bytes.byteLength,
         total_bytes: summary.total_bytes,
         frames_completed: frames.length
-      }).catch(() => {});
+      }));
     }
     for (const frame of frames) {
       if (sampled(frame.event_index)) {
-        void trace.recordSse(context, "event", { ...frame }).catch(() => {});
+        void trace.bestEffort(() => trace.recordSse(context, "event", { ...frame }));
       }
     }
   });
@@ -144,17 +150,19 @@ async function withMcpProtocolTrace(
     event: "finish" | "close" | "error",
     error?: unknown
   ) => {
-    recordSseSummary(event);
-    const snapshot = capture.snapshot();
-    void trace.recordResponseLifecycle(context, event, {
-      statusCode: res.statusCode,
-      responseBytes: snapshot.totalBytes,
-      afterFinish: responseFinished || res.writableEnded,
-      writableEnded: res.writableEnded,
-      headersSent: res.headersSent,
-      requestAborted: req.aborted,
-      ...(error !== undefined ? { error } : {})
-    }).catch(() => {});
+    void trace.bestEffort(async () => {
+      recordSseSummary(event);
+      const snapshot = capture.snapshot();
+      await trace.recordResponseLifecycle(context, event, {
+        statusCode: res.statusCode,
+        responseBytes: snapshot.totalBytes,
+        afterFinish: responseFinished || res.writableEnded,
+        writableEnded: res.writableEnded,
+        headersSent: res.headersSent,
+        requestAborted: req.aborted,
+        ...(error !== undefined ? { error } : {})
+      });
+    });
   };
   res.once("finish", () => {
     responseFinished = true;
@@ -172,20 +180,23 @@ async function withMcpProtocolTrace(
   } catch {}
 
   await trace.run(context, async () => {
-    await trace.recordRequest(req.body, requestBytes);
+    await trace.bestEffort(() => trace.recordRequest(req.body, requestBytes));
     try {
       await fn();
     } finally {
-      const snapshot = capture.snapshot();
-      let responseBody: unknown = snapshot.text;
-      try {
-        responseBody = snapshot.text ? JSON.parse(snapshot.text) : "";
-      } catch {}
-      await trace.recordResponse({
-        statusCode: res.statusCode,
-        body: responseBody,
-        responseBytes: snapshot.totalBytes,
-        isError: res.statusCode >= 400
+      // A diagnostic failure in finally must not replace a transport/business error.
+      await trace.bestEffort(async () => {
+        const snapshot = capture.snapshot();
+        let responseBody: unknown = snapshot.text;
+        try {
+          responseBody = snapshot.text ? JSON.parse(snapshot.text) : "";
+        } catch {}
+        await trace.recordResponse({
+          statusCode: res.statusCode,
+          body: responseBody,
+          responseBytes: snapshot.totalBytes,
+          isError: res.statusCode >= 400
+        });
       });
     }
   });

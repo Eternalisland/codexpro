@@ -5,10 +5,15 @@ import { redactSensitiveText } from "../redact.js";
 import { detectProjectTypes } from "./classify.js";
 import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorkspaceAnalysis } from "./cache.js";
 import { extractWorkspaceFiles } from "./extract.js";
-import { buildRelationships } from "./graph.js";
+import { buildRelationshipsWithCoverage } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
 import { classifySearchIntent, emptySearchGroups, groupForFile, sortStructuredMatches } from "./rank.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
+
+/**
+ * V100(20261019) yijiakang 【可靠性修复】汇总符号及依赖关系预算的部分覆盖状态与警告，任务号:20260509145520000648
+ */
+const verNum = "V100(20261019)";
 
 function cacheKey(workspace: Workspace, fingerprint: string, config: CodexProConfig): string {
   return `${workspace.id}:${fingerprint}:${JSON.stringify(config.analysisLimits)}`;
@@ -35,9 +40,15 @@ export async function inspectWorkspace(config: CodexProConfig, guard: PathGuard,
 
   const extraction = await extractWorkspaceFiles(config, guard, workspace, inventory.files);
   const symbols = extraction.files.flatMap((file) => file.symbols).slice(0, config.analysisLimits.maxSymbols);
-  const relationships = buildRelationships(extraction.files, inventory.files, config.analysisLimits.maxRelationships);
+  const relationshipResult = buildRelationshipsWithCoverage(extraction.files, inventory.files, config.analysisLimits.maxRelationships);
+  const relationships = relationshipResult.relationships;
   const languages = [...new Set(inventory.files.map((file) => file.language).filter((language) => language !== "unknown"))].sort();
-  const warnings = [...inventory.coverage.warnings, ...extraction.warnings];
+  // 符号预算状态由提取层提供，关系预算状态也必须向搜索、审查和缓存结果传播。
+  const warnings = [
+    ...inventory.coverage.warnings,
+    ...extraction.warnings,
+    ...(relationshipResult.truncated ? ["Relationship extraction reached its configured limit."] : [])
+  ];
   const result: WorkspaceAnalysis = {
     schemaVersion: 1,
     workspaceId: workspace.id,
@@ -56,7 +67,7 @@ export async function inspectWorkspace(config: CodexProConfig, guard: PathGuard,
       scannedBytes: extraction.scannedBytes,
       symbolCount: symbols.length,
       relationshipCount: relationships.length,
-      truncated: inventory.coverage.truncated || extraction.truncated,
+      truncated: inventory.coverage.truncated || extraction.truncated || relationshipResult.truncated,
       warnings
     },
     warnings,

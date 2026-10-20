@@ -16,6 +16,7 @@ import {
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
 import { runTraceCli } from './trace-cli.mjs';
+import { startTraceExplorer } from './trace-explorer.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UNTRACKED_FILE_HASH_BYTES = 64 * 1024;
@@ -40,6 +41,7 @@ Usage:
   codexpro settings
   codexpro doctor
   codexpro trace tail
+  codexpro trace explorer
   codexpro trace show --last
   codexpro trace show --request <request_id>
   codexpro trace show --job <job_id>
@@ -2960,6 +2962,9 @@ async function runLoopHandoff(argv) {
   if (finalVerdict !== 'PASS') process.exitCode = 1;
 }
 
+let traceDirectoryForControlPanel = '';
+let traceModeForControlPanel = 'off';
+
 function createConnectorDetails(endpoint, token, localBase = '') {
   const serverUrl = endpointWithToken(endpoint, token);
   return {
@@ -3038,9 +3043,9 @@ function printConnectorBlock(endpoint, token, options = {}) {
     console.log(`CODEXPRO_READY ${serverUrl}`);
   } else {
     console.log('Next: press Enter to open ChatGPT, paste the copied Server URL, choose Authentication: None.');
-    console.log('Keys: Enter open | c copy | o status | h help | q quit');
+    console.log('Keys: Enter open | c copy | o status | t traces | h help | q quit');
   }
-  return { ...details, copied, opened, mode, toolMode: options.toolMode ?? 'standard' };
+  return { ...details, copied, opened, mode, traceDir: traceDirectoryForControlPanel, traceMode: traceModeForControlPanel, toolMode: options.toolMode ?? 'standard' };
 }
 
 function printControlHelp() {
@@ -3050,6 +3055,7 @@ function printControlHelp() {
   console.log('  c      copy Server URL again');
   console.log('  u      print Server URL only');
   console.log('  o      open local setup/status page');
+  console.log('  t      open real-time Trace Explorer in your browser');
   console.log('  p      print Create App fields');
   console.log('  m      print mode help');
   console.log('  h      show controls');
@@ -3896,6 +3902,31 @@ function writeControlPrompt() {
 }
 
 function runControlPanel(details, cleanup = cleanupChildren) {
+  let traceExplorer = null;
+  let openingExplorer = false;
+  const openTraceExplorer = async () => {
+    if (openingExplorer) return;
+    openingExplorer = true;
+    try {
+      if (!traceExplorer) {
+        traceExplorer = await startTraceExplorer({
+          dir: details.traceDir || path.join(codexProHome(), 'traces'),
+          openBrowser: openUrl
+        });
+      } else {
+        openUrl(traceExplorer.url);
+      }
+      console.log('\nTrace Explorer: ' + traceExplorer.url);
+      if (details.traceMode === 'off') {
+        console.log('Trace recording is off. Restart with --mcp-trace redacted to capture new events.');
+      }
+    } catch (error) {
+      console.log('\nUnable to open Trace Explorer: ' + String(error?.message || error));
+    } finally {
+      openingExplorer = false;
+      writeControlPrompt();
+    }
+  };
   if (!process.stdin.isTTY) {
     process.stdin.setEncoding('utf8');
     process.stdin.resume();
@@ -3943,6 +3974,8 @@ function runControlPanel(details, cleanup = cleanupChildren) {
           console.log(opened ? '\nOpened local CodexPro setup/status page.' : `\nCould not open automatically. Open this URL:\n${details.localStatusUrl}`);
         }
         writeControlPrompt();
+      } else if (normalized === 't') {
+        void openTraceExplorer();
       } else if (normalized === 'p') {
         console.log('');
         printCreateAppFields(details);
@@ -3999,7 +4032,7 @@ async function main() {
     return;
   }
   if (subcommand === 'trace') {
-    await runTraceCli(argv.slice(1));
+    await runTraceCli(argv.slice(1), { openBrowser: openUrl });
     return;
   }
   if (subcommand === 'stable-help') {
@@ -4154,6 +4187,8 @@ async function main() {
       ? path.resolve(expandedTraceDir)
       : path.resolve(root, expandedTraceDir)
     : '';
+  traceDirectoryForControlPanel = resolvedTraceDir || path.join(codexProHome(), 'traces');
+  traceModeForControlPanel = mcpTrace;
   validateChoice('bash', bash, ['off', 'safe', 'full']);
   if (bashRuntime === 'wsl' && process.platform !== 'win32') {
     throw new Error('--bash-runtime=wsl is only supported on Windows.');

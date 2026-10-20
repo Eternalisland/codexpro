@@ -18,14 +18,14 @@ CodexPro aims to be the safest, most reliable bridge between ChatGPT and explici
 
 ## Next: durable work sessions
 
-- Add managed background commands with bounded, paginated output and explicit stop controls.
+- Implemented: managed background project checks with bounded, paginated output and explicit stop controls through `start_check`, `wait_check`, and `stop_check`.
 - Produce a redacted support report that users can attach to issues without exposing tokens, home paths, or repository contents.
-- Improve reconnect and resume diagnostics for long-running ChatGPT sessions and tunnel changes.
+- Partially implemented: durable check receipts, `recover_work`, runner leases, workspace fingerprint checks, and live process diagnostics support reconnect and controlled resume; clearer guidance for long-running ChatGPT sessions and tunnel changes remains planned.
 - Keep command execution scoped to allowed workspaces and retain auditable receipts for handoffs.
 
 ## Later: optional user interface
 
-- Explore a local dashboard for connection health, active workspaces, running jobs, diffs, and handoff status.
+- Partially implemented: the local trace explorer provides request timelines and recorded file-change diffs. A unified dashboard for connection health, active workspaces, running jobs, and handoff status remains planned.
 - Keep the command-line and MCP server fully usable without a desktop application.
 - Treat computer control and broad operating-system automation as separate, opt-in capabilities with stronger foreground-app, executable-integrity, and permission checks.
 

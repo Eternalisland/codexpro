@@ -37,6 +37,10 @@ export interface TracePayloadSummary {
 }
 
 type TraceEvent = Record<string, unknown>;
+const TRACE_FAILURE_CODES = new Set([
+  "EACCES", "EPERM", "ENOENT", "ENOTDIR", "EISDIR", "ENOSPC", "EROFS", "EMFILE",
+  "ENFILE", "EIO", "EEXIST", "EINVAL", "EFBIG", "ENAMETOOLONG", "ELOOP", "EBUSY", "EDQUOT"
+]);
 
 function isoDay(date = new Date()): string {
   return date.toISOString().slice(0, 10);
@@ -283,14 +287,44 @@ function safeJsonLine(event: TraceEvent): string {
 }
 
 export class ProtocolTraceManager {
+  /**
+   * V100(20261019) yijiakang 【可靠性修复】隔离 Trace 序列化和 IO 失败，任务号:20260509145520000648
+   */
+  static readonly verNum = "V100(20261019)";
+
   private readonly storage = new AsyncLocalStorage<ProtocolTraceContext>();
   private writeChain: Promise<void> = Promise.resolve();
   private retentionCheckedDay = "";
+  private failureWarned = false;
 
   constructor(readonly config: ProtocolTraceConfig) {}
 
   get enabled(): boolean {
     return this.config.mode !== "off";
+  }
+
+  async bestEffort<T>(operation: () => T | Promise<T>): Promise<T | undefined> {
+    try {
+      return await operation();
+    } catch (error) {
+      this.warnFailure(error);
+      return undefined;
+    }
+  }
+
+  private warnFailure(error: unknown): void {
+    if (this.failureWarned) return;
+    this.failureWarned = true;
+    // A filesystem error message may contain a private path or payload. Only expose a
+    // bounded error code, and warn once while allowing later writes to recover.
+    let code = "UNKNOWN";
+    try {
+      const candidate = (error as { code?: unknown } | null)?.code;
+      if (typeof candidate === "string" && TRACE_FAILURE_CODES.has(candidate)) code = candidate;
+    } catch { /* Error objects may themselves have throwing getters. */ }
+    try {
+      console.warn(`[CodexPro Trace] Trace recording failed (${code}); MCP and tools continue. Further Trace warnings are suppressed.`);
+    } catch { /* A closed diagnostic stream must not affect the business operation. */ }
   }
 
   current(): ProtocolTraceContext | undefined {
@@ -337,13 +371,13 @@ export class ProtocolTraceManager {
   async recordRequest(body: unknown, requestBytes?: number): Promise<void> {
     const ctx = this.current();
     if (!ctx || !this.enabled) return;
-    await this.record({
+    await this.record(() => ({
       event: "mcp.request",
       ...this.contextFields(ctx),
       ...(ctx.tool ? { tool: ctx.tool } : {}),
       request_bytes: requestBytes ?? undefined,
       payload: summarizeTracePayload(body, this.config.mode, this.config.maxBodyBytes)
-    });
+    }));
   }
 
   async recordSse(
@@ -352,13 +386,13 @@ export class ProtocolTraceManager {
     details: Record<string, string | number | boolean>
   ): Promise<void> {
     if (!this.enabled) return;
-    await this.record({
+    await this.record(() => ({
       ...details,
       ...this.contextFields(context),
       ...(context.tool ? { tool: context.tool } : {}),
       event: `mcp.sse.${kind}`,
       elapsed_ms: Date.now() - context.startedAtMs
-    });
+    }));
   }
 
   async recordResponseLifecycle(
@@ -375,7 +409,7 @@ export class ProtocolTraceManager {
     }
   ): Promise<void> {
     if (!this.enabled) return;
-    await this.record({
+    await this.record(() => ({
       event: `http.response.${event}`,
       ...this.contextFields(context),
       ...(context.tool ? { tool: context.tool } : {}),
@@ -388,7 +422,7 @@ export class ProtocolTraceManager {
       ...(input.requestAborted !== undefined ? { request_aborted: input.requestAborted } : {}),
       ...(event === "close" ? { client_aborted: input.afterFinish === false } : {}),
       ...(input.error !== undefined ? { error: redactSensitiveText(input.error instanceof Error ? input.error.message : String(input.error)) } : {})
-    });
+    }));
   }
 
   async recordResponse(input: {
@@ -399,7 +433,7 @@ export class ProtocolTraceManager {
   }): Promise<void> {
     const ctx = this.current();
     if (!ctx || !this.enabled) return;
-    await this.record({
+    await this.record(() => ({
       event: "mcp.response",
       ...this.contextFields(ctx),
       ...(ctx.tool ? { tool: ctx.tool } : {}),
@@ -415,7 +449,7 @@ export class ProtocolTraceManager {
             this.config.mode,
             this.config.maxBodyBytes
           )
-    });
+    }));
   }
 
   async recordExecution(
@@ -428,14 +462,16 @@ export class ProtocolTraceManager {
     if (!context || !this.enabled) return;
     // Managed jobs continue after an MCP response; retain the originating request context
     // explicitly rather than relying on AsyncLocalStorage across future timer/process callbacks.
-    const { event: runtimeEvent, ...fields } = details;
-    await this.record({
-      ...fields,
-      ...(typeof runtimeEvent === "string" ? { runtime_event: runtimeEvent } : {}),
-      ...this.contextFields(context),
-      ...(context.tool ? { tool: context.tool } : {}),
-      job_id: jobId,
-      event: `execution.${kind}`
+    await this.record(() => {
+      const { event: runtimeEvent, ...fields } = details;
+      return {
+        ...fields,
+        ...(typeof runtimeEvent === "string" ? { runtime_event: runtimeEvent } : {}),
+        ...this.contextFields(context),
+        ...(context.tool ? { tool: context.tool } : {}),
+        job_id: jobId,
+        event: `execution.${kind}`
+      };
     });
   }
 
@@ -444,15 +480,17 @@ export class ProtocolTraceManager {
     const spanId = newSpanId();
     const startedAtMs = Date.now();
     if (!ctx || !this.enabled) return { spanId, startedAtMs };
-    await this.record({
+    await this.record(() => ({
       event: "tool.start",
       ...this.contextFields(ctx),
       span_id: spanId,
       tool,
+      ...(args && typeof args === "object" && "workspace_id" in args &&
+        typeof args.workspace_id === "string" ? { workspace_id: args.workspace_id } : {}),
       ...(eventRequestId(args) ? { check_request_id: eventRequestId(args) } : {}),
       ...(eventJobId(args) ? { job_id: eventJobId(args) } : {}),
       arguments: summarizeTracePayload(args, this.config.mode, this.config.maxBodyBytes)
-    });
+    }));
     return { spanId, startedAtMs };
   }
 
@@ -466,24 +504,57 @@ export class ProtocolTraceManager {
   }): Promise<void> {
     const ctx = this.current();
     if (!ctx || !this.enabled) return;
-    const payloadValue =
-      input.status === "error"
-        ? { error: input.error instanceof Error ? input.error.message : String(input.error ?? "unknown error") }
-        : input.result;
-    await this.record({
-      event: "tool.end",
-      ...this.contextFields(ctx),
-      span_id: input.spanId,
-      tool: input.tool,
-      status: input.status,
-      duration_ms: Date.now() - input.startedAtMs,
-      ...(eventJobId(input.result) ? { job_id: eventJobId(input.result) } : {}),
-      result: summarizeTracePayload(payloadValue, this.config.mode, this.config.maxBodyBytes)
+    await this.bestEffort(async () => {
+      const payloadValue =
+        input.status === "error"
+          ? { error: input.error instanceof Error ? input.error.message : String(input.error ?? "unknown error") }
+          : input.result;
+      const structured = (input.result as { structuredContent?: Record<string, unknown> } | undefined)?.structuredContent;
+      await this.record(() => ({
+        event: "tool.end",
+        ...this.contextFields(ctx),
+        span_id: input.spanId,
+        tool: input.tool,
+        ...(typeof structured?.workspace_id === "string" ? { workspace_id: structured.workspace_id } : {}),
+        status: input.status,
+        duration_ms: Date.now() - input.startedAtMs,
+        ...(eventJobId(input.result) ? { job_id: eventJobId(input.result) } : {}),
+        result: summarizeTracePayload(payloadValue, this.config.mode, this.config.maxBodyBytes)
+      }));
+
+      // File tools already return the operation's exact diff. Preserve it separately from
+      // tool.end's bounded response so each historical edit remains attributable to a span.
+      if (input.status !== "ok") return;
+      const changeTool = input.tool === "codexpro" ? structured?.codexpro_super_action : input.tool;
+      if (!["write", "edit", "apply_patch"].includes(String(changeTool)) ||
+          !structured || typeof structured.diff !== "string") return;
+      const diff = structured.diff;
+      const paths = changeTool === "apply_patch"
+        ? (Array.isArray(structured.paths) ? structured.paths.filter((item): item is string => typeof item === "string") : [])
+        : (typeof structured.path === "string" ? [structured.path] : []);
+      const additions = typeof structured.additions === "number" ? structured.additions : 0;
+      const deletions = typeof structured.deletions === "number" ? structured.deletions : 0;
+      const changed = changeTool === "apply_patch"
+        ? structured.changed === true
+        : additions > 0 || deletions > 0;
+      if (!changed || !paths.length) return;
+      await this.record(() => ({
+        event: "workspace.change",
+        ...this.contextFields(ctx),
+        span_id: input.spanId,
+        tool: changeTool,
+        workspace_id: structured.workspace_id,
+        paths,
+        additions,
+        deletions,
+        source_truncated: /\.\.\.\[diff truncated to \d+ chars\]$/.test(diff),
+        patch: summarizeTracePayload(diff, this.config.mode, this.config.maxBodyBytes)
+      }));
     });
   }
 
   async flush(): Promise<void> {
-    await this.writeChain.catch(() => {});
+    await this.bestEffort(() => this.writeChain);
   }
 
   private contextFields(ctx: ProtocolTraceContext): TraceEvent {
@@ -498,21 +569,22 @@ export class ProtocolTraceManager {
     };
   }
 
-  private async record(event: TraceEvent): Promise<void> {
-    const entry = {
-      ts: new Date().toISOString(),
-      ...event
-    };
-    const line = safeJsonLine(entry);
-    this.writeChain = this.writeChain
-      .catch(() => {})
-      .then(async () => {
-        await this.cleanupRetentionIfNeeded();
-        const filePath = await this.currentFile(byteLength(line));
-        await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-        await fsp.appendFile(filePath, line, { encoding: "utf8", mode: 0o600 });
-      });
-    await this.writeChain;
+  private async record(createEvent: () => TraceEvent): Promise<void> {
+    await this.bestEffort(async () => {
+      // Construct and serialize inside the diagnostic boundary: getters and unsupported
+      // JSON values can fail before asynchronous filesystem work even starts.
+      const line = safeJsonLine({ ts: new Date().toISOString(), ...createEvent() });
+      this.writeChain = this.writeChain
+        .then(async () => {
+          await this.cleanupRetentionIfNeeded();
+          const filePath = await this.currentFile(byteLength(line));
+          await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+          await fsp.appendFile(filePath, line, { encoding: "utf8", mode: 0o600 });
+        })
+        .catch((error) => this.warnFailure(error));
+      // Keep flush/record ordered and awaitable without leaving a rejected writeChain.
+      await this.writeChain;
+    });
   }
 
   private async currentFile(incomingBytes: number): Promise<string> {
@@ -550,7 +622,9 @@ export class ProtocolTraceManager {
       try {
         const stat = await fsp.stat(filePath);
         if (stat.mtimeMs < cutoff) await fsp.rm(filePath, { force: true });
-      } catch {}
+      } catch (error) {
+        this.warnFailure(error);
+      }
     }
   }
 }

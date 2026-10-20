@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Allowed `write`, `edit`, and `apply_patch` to persist credential-shaped source text without blocking; retained output/trace redaction, workspace path restrictions, and write safeguards. Do not commit real credentials to source control.
+- Rejected invalid UTF-8 in text reads and existing-file writes/edits to prevent lossy decoding from corrupting file contents, while preserving valid UTF-8 BOMs and line endings.
+- Strengthened verification fingerprints to cover complete relevant content and refuse check recovery or resume when workspace state cannot be verified reliably.
+- Isolated protocol tracing failures from tool execution results and read rotated trace files in numeric sequence for tail and latest-trace selection.
+- Unified tool registration and self-test capability policies so enabled Codex session read tools remain consistent across minimal, standard, and full tool modes.
+- Reported partial repository-analysis coverage and warnings when the relationship budget discards dependencies; retained correct symbol-budget reporting and complete coverage when results exactly fill either budget.
+- Made `npm run smoke` build current sources before the core, integration, and new reliability suites; added `smoke:reliability` and `check:reliability` for focused regression checks.
+
 - Added bounded multi-repository Git status and diff aggregation for non-Git workspace roots that contain independent child repositories.
 
 ## 0.30.3 (2026-10-01)

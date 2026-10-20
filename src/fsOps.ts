@@ -2,11 +2,17 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import { isUtf8 } from "node:buffer";
 import { minimatch } from "minimatch";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
-import { hasNewSecretValue, hasSecretValue, redactSensitiveText } from "./redact.js";
+import { redactSensitiveText } from "./redact.js";
+
+/**
+ * V100(20261019) yijiakang 【可靠性修复】拒绝有损 UTF-8 解码，保护原文件字节，任务号:20260509145520000648
+ */
+export const verNum = "V100(20261019)";
 
 export interface TreeOptions {
   path?: string;
@@ -41,6 +47,15 @@ export interface DiffResult {
 
 export function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+// Reject invalid bytes before decoding: replacement characters cannot reconstruct the original encoding.
+function decodeUtf8Text(buffer: Buffer, relPath: string): string {
+  if (!isUtf8(buffer)) {
+    throw new CodexProError(`File is not valid UTF-8: ${relPath}. Text reads and edits require UTF-8; convert the file explicitly while preserving its original content before retrying.`);
+  }
+  // Buffer.toString retains a UTF-8 BOM, so edits preserve it along with the original line endings.
+  return buffer.toString("utf8");
 }
 
 const fileWriteLocks = new Map<string, Promise<void>>();
@@ -100,7 +115,7 @@ async function writeText(absPath: string, content: string, existingText?: string
   if (existingText !== undefined) {
     const handle = await fsp.open(absPath, "r+");
     try {
-      const currentText = await handle.readFile("utf8");
+      const currentText = decodeUtf8Text(await handle.readFile(), relPath);
       if (currentText !== existingText) {
         throw new CodexProError(`File changed during write: ${relPath}. Read the file again before writing.`);
       }
@@ -322,7 +337,7 @@ export async function readTextFile(
   const hasRange = options.startLine !== undefined || options.endLine !== undefined;
   await guard.assertTextFile(resolved.absPath, hasRange ? textScanByteLimit(config) : maxBytes);
   const buffer = await fsp.readFile(resolved.absPath);
-  const text = buffer.toString("utf8");
+  const text = decodeUtf8Text(buffer, resolved.relPath);
   const allLines = splitLines(text);
   const totalLines = allLines.length;
   const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
@@ -431,9 +446,6 @@ export async function writeTextFile(
   if (contentBytes > config.maxWriteBytes) {
     throw new CodexProError(`Write content is too large (${contentBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (hasSecretValue(content)) {
-    throw new CodexProError("Secret-looking content is blocked from write. Use placeholders such as [REDACTED_SECRET] in handoff files.");
-  }
 
   const releaseWriteLock = await acquireFileWriteLock(resolved.absPath);
   try {
@@ -441,7 +453,7 @@ export async function writeTextFile(
     let existed = false;
     try {
       await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
-      oldText = await fsp.readFile(resolved.absPath, "utf8");
+      oldText = decodeUtf8Text(await fsp.readFile(resolved.absPath), resolved.relPath);
       existed = true;
     } catch (error) {
       if (error instanceof CodexProError && error.message.startsWith("Not a file")) throw error;
@@ -481,7 +493,7 @@ export async function editTextFile(
   const releaseWriteLock = await acquireFileWriteLock(resolved.absPath);
   try {
     await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
-    const before = await fsp.readFile(resolved.absPath, "utf8");
+    const before = decodeUtf8Text(await fsp.readFile(resolved.absPath), resolved.relPath);
     assertExpectedSha(options.expectedSha256, before, resolved.relPath);
     const occurrences = before.split(oldText).length - 1;
     if (occurrences === 0) {
@@ -508,9 +520,6 @@ export async function editTextFile(
     const afterBytes = Buffer.byteLength(after, "utf8");
     if (afterBytes > config.maxWriteBytes) {
       throw new CodexProError(`Edited file would be too large (${afterBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
-    }
-    if (hasNewSecretValue(before, after)) {
-      throw new CodexProError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
     }
 
     const diff = makeUnifiedDiff(before, after, resolved.relPath);

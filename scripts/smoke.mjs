@@ -255,6 +255,11 @@ function hasToolCardStatusMeta(name) {
   const meta = toolsByName.get(name)?._meta ?? {};
   return Boolean(meta['openai/toolInvocation/invoking'] || meta['openai/toolInvocation/invoked']);
 }
+async function expectSuccessfulTool(name, args) {
+  const result = await client.request('tools/call', { name, arguments: args });
+  if (result.isError) throw new Error(`${name} rejected source content that looks like a credential`);
+  return result;
+}
 async function expectToolError(name, args, pattern, targetClient = client) {
   const result = await targetClient.request('tools/call', { name, arguments: args });
   if (!result.isError) {
@@ -579,9 +584,9 @@ for (const leaked of ['ghp_abcdefghijklmnopqrstuvwxyz123456', 'verysecretcodexpr
 if (!tokenPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token')) {
   throw new Error('redaction hid a non-secret Cloudflare token-file path');
 }
-await expectToolError('write', { workspace_id: ws, path: 'notes.md', content: 'OPENAI_API_KEY=sk-realSecretValue123\n' }, /Secret-looking content is blocked/);
-await expectToolError('write', { workspace_id: ws, path: 'token.txt', content: 'codexpro_token=shorttok\n' }, /Secret-looking content is blocked/);
-await expectToolError('write', { workspace_id: ws, path: 'notes.yaml', content: 'api_key: yamlsecretvalueabcdefghijklmnop\n' }, /Secret-looking content is blocked/);
+await expectSuccessfulTool('write', { workspace_id: ws, path: 'notes.md', content: 'OPENAI_API_KEY=sk-realSecretValue123\n' });
+await expectSuccessfulTool('write', { workspace_id: ws, path: 'token.txt', content: 'codexpro_token=shorttok\n' });
+await expectSuccessfulTool('write', { workspace_id: ws, path: 'notes.yaml', content: 'api_key: yamlsecretvalueabcdefghijklmnop\n' });
 await client.request('tools/call', {
   name: 'write',
   arguments: {
@@ -590,6 +595,36 @@ await client.request('tools/call', {
     content: 'const TOKEN = process.env.TOKEN;\nconst OPENAI_API_KEY = process.env.OPENAI_API_KEY;\nconst apiToken = getToken();\n'
   }
 });
+// Credential-shaped source is allowed to be written and edited; responses stay redacted.
+const syntheticCredential = ['sk', 'fixtureValueForLocalSource12345'].join('-');
+const credentialFixturePath = 'credential-fixture.txt';
+await fs.writeFile(path.join(tmp, credentialFixturePath), 'initial\n', 'utf8');
+const credentialEdit = await expectSuccessfulTool('edit', {
+  workspace_id: ws, path: credentialFixturePath,
+  old_text: 'initial', new_text: syntheticCredential
+});
+if ((await fs.readFile(path.join(tmp, credentialFixturePath), 'utf8')) !== syntheticCredential + '\n') {
+  throw new Error('edit did not persist a credential-shaped fixture');
+}
+if (JSON.stringify(credentialEdit).includes(syntheticCredential)) {
+  throw new Error('edit response leaked a credential-shaped fixture');
+}
+const credentialPatch = await expectSuccessfulTool('apply_patch', {
+  workspace_id: ws, patch: [
+    'diff --git a/credential-fixture.txt b/credential-fixture.txt',
+    '--- a/credential-fixture.txt',
+    '+++ b/credential-fixture.txt',
+    '@@ -1 +1,2 @@',
+    ' ' + syntheticCredential,
+    '+' + syntheticCredential
+  ].join('\n') + '\n'
+});
+if ((await fs.readFile(path.join(tmp, credentialFixturePath), 'utf8')).replace(/\r\n/g, '\n') !== syntheticCredential + '\n' + syntheticCredential + '\n') {
+  throw new Error('apply_patch did not persist credential-shaped context and added text');
+}
+if (JSON.stringify(credentialPatch).includes(syntheticCredential)) {
+  throw new Error('apply_patch response leaked a credential-shaped fixture');
+}
 const inspectAfterWrite = await client.request('tools/call', { name: 'inspect_workspace', arguments: { workspace_id: ws } });
 if (inspectAfterWrite.structuredContent.cache?.hit !== false || !inspectAfterWrite.structuredContent.files?.some((file) => file.path === 'env-ref.js')) {
   throw new Error(`write did not invalidate workspace analysis: ${JSON.stringify(inspectAfterWrite.structuredContent.cache)}`);

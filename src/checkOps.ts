@@ -2,11 +2,16 @@ import { createHash } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
-import type { PathGuard, Workspace } from "./guard.js";
+import { CodexProError, isSubpath, normalizeRelPath, type PathGuard, type Workspace } from "./guard.js";
 import { discoverWorkspaceChecks } from "./analysis/index.js";
 import type { AnalysisCommandRecommendation } from "./analysis/types.js";
 import { runBash, type BashOutputEvent, type BashProcessInfo, type BashRuntimeEvent } from "./bashOps.js";
-import { gitDiff, gitDiffStatus } from "./gitOps.js";
+import { gitFingerprintInputs } from "./gitOps.js";
+
+/**
+ * V100(20261019) yijiakang 【可靠性修复】使用完整 Git 状态及受预算约束的文件内容校验工作区一致性，任务号:20260509145520000648
+ */
+export const verNum = "V100(20261019)";
 
 export type RunChecksPhase =
   | "discovering_checks"
@@ -138,45 +143,90 @@ function selectRecommendations(
   return { selected, unavailable };
 }
 
-function looksLikeGitError(value: string): boolean {
-  const lower = value.trim().toLowerCase();
-  return (
-    lower.startsWith("fatal:") ||
-    lower.startsWith("error:") ||
-    lower.startsWith("git unavailable or failed:") ||
-    lower.startsWith("git exited with status") ||
-    lower.includes("not a git repository")
-  );
-}
-
 export async function workspaceFingerprint(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace
 ): Promise<string> {
-  const status = gitDiffStatus(config, guard, workspace);
-  const diff = gitDiff(config, guard, workspace);
+  const git = gitFingerprintInputs(config, guard, workspace);
   const hash = createHash("sha256");
-  hash.update(status).update("\0").update(diff).update("\0");
-
-  if (!looksLikeGitError(status)) {
-    for (const line of status.split(/\r?\n/)) {
-      const match = line.trim().match(/^\?\?\s+(.+)$/);
-      if (!match) continue;
-      const relPath = match[1];
-      hash.update(relPath).update("\0");
-      try {
-        const resolved = guard.resolve(workspace, relPath);
-        const stat = await fsp.stat(resolved.absPath);
-        hash.update(String(stat.size)).update("\0").update(String(Math.floor(stat.mtimeMs))).update("\0");
-        if (stat.isFile() && stat.size <= config.maxReadBytes) hash.update(await fsp.readFile(resolved.absPath));
-      } catch (error) {
-        hash.update(error instanceof Error ? error.message : String(error));
+  hash.update("workspace-fingerprint-v2\0").update(git?.digest ?? "files-only").update("\0");
+  const paths = git ? [...git.untrackedPaths] : [];
+  // 宽工作区可能同时有独立子仓库与仓库外项目；根目录的普通文件也属于校验范围。
+  if (!git?.repositoryRoots.includes(workspace.root)) {
+    const pending = [workspace.root];
+    let scannedDirectories = 0;
+    while (pending.length > 0) {
+      const directory = pending.pop()!;
+      scannedDirectories += 1;
+      if (scannedDirectories > config.analysisLimits.maxInventoryFiles) {
+        throw new CodexProError("Cannot compute workspace fingerprint: directory inventory limit exceeded.");
       }
-      hash.update("\0");
+      const entries = await fsp.readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        const absolute = path.join(directory, entry.name);
+        const relative = normalizeRelPath(path.relative(workspace.root, absolute));
+        if (guard.isBlockedRelativePath(relative)) continue;
+        if (entry.isDirectory()) {
+          if (!git?.repositoryRoots.includes(absolute)) pending.push(absolute);
+        } else if (entry.isFile() || entry.isSymbolicLink()) paths.push(relative);
+        if (paths.length > config.analysisLimits.maxInventoryFiles) {
+          throw new CodexProError("Cannot compute workspace fingerprint: file inventory limit exceeded.");
+        }
+      }
     }
   }
 
+  let scannedBytes = git?.scannedBytes ?? 0;
+  let scannedFiles = 0;
+  for (const relative of [...new Set(paths)].sort()) {
+    if (guard.isBlockedRelativePath(relative)) continue;
+    const absolute = path.resolve(workspace.root, relative);
+    if (!isSubpath(absolute, workspace.root)) throw new CodexProError("Cannot compute workspace fingerprint: path escapes workspace.");
+    const stat = await fsp.lstat(absolute);
+    // 外层 Git 会把内嵌仓库列为目录；其 HEAD/index/文件已由专用仓库快照覆盖。
+    if (stat.isDirectory() && git?.repositoryRoots.includes(absolute)) continue;
+    scannedFiles += 1;
+    if (scannedFiles > config.analysisLimits.maxInventoryFiles) {
+      throw new CodexProError("Cannot compute workspace fingerprint: file inventory limit exceeded.");
+    }
+    hash.update(relative).update("\0").update(String(stat.mode)).update("\0");
+    if (stat.isSymbolicLink()) {
+      const target = await fsp.readlink(absolute);
+      scannedBytes += Buffer.byteLength(target);
+      hash.update("symlink\0").update(target).update("\0");
+    } else {
+      if (!stat.isFile()) throw new CodexProError(`Cannot fingerprint unsupported file type: ${relative}`);
+      const resolved = guard.resolve(workspace, relative);
+      scannedBytes += stat.size;
+      if (scannedBytes > config.analysisLimits.maxScannedBytes) {
+        throw new CodexProError("Cannot compute workspace fingerprint: content byte budget exceeded.");
+      }
+      hash.update(String(stat.size)).update("\0");
+      const handle = await fsp.open(resolved.absPath, "r");
+      try {
+        // 分块读取完整内容，不依赖 maxReadBytes、mtime 或 MCP 输出截断后的文本。
+        const buffer = Buffer.alloc(64 * 1_024);
+        let position = 0;
+        while (position < stat.size) {
+          const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, stat.size - position), position);
+          if (bytesRead === 0) break;
+          hash.update(buffer.subarray(0, bytesRead));
+          position += bytesRead;
+        }
+        const after = await handle.stat();
+        if (position !== stat.size || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) {
+          throw new CodexProError(`Cannot compute workspace fingerprint: file changed while being read: ${relative}`);
+        }
+      } finally {
+        await handle.close();
+      }
+      hash.update("\0");
+    }
+    if (scannedBytes > config.analysisLimits.maxScannedBytes) {
+      throw new CodexProError("Cannot compute workspace fingerprint: content byte budget exceeded.");
+    }
+  }
   return hash.digest("hex");
 }
 

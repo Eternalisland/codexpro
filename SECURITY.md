@@ -143,7 +143,8 @@ Resolution order:
 CodexPro currently pins `cloudflared` `2026.7.2` and verifies the selected asset
 against its published SHA-256 before writing or extracting it. Updating the
 version requires updating every supported platform digest in
-`scripts/cloudflared-release.mjs` and passing `npm run test:settings`.
+`scripts/cloudflared-release.mjs` and passing `npm run build` followed by
+`node scripts/settings-smoke.mjs`.
 
 Use `--install-cloudflared` to reinstall the verified pinned binary. Use
 `--no-install-cloudflared` to disable downloads.
@@ -160,3 +161,5 @@ CodexPro blocks common sensitive paths by default:
 - symlinks that resolve outside the workspace or into blocked paths
 
 These guards reduce risk. They are not an OS sandbox.
+
+Workspace `write`, `edit`, and `apply_patch` no longer reject content just because it resembles a token or other credential. This avoids blocking legitimate auth-related source changes, but it also means a caller with workspace write access can persist real secrets in allowed files. Tool responses and traces continue to redact recognized secrets; this does not protect on-disk content or Git commits. Keep credentials outside source control and use a separate secret scanner before committing.

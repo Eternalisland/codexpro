@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
@@ -6,6 +7,11 @@ import { resolveBashInvocation } from "./bashOps.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, isSubpath, normalizeRelPath, PathGuard } from "./guard.js";
 import { redactSensitiveText } from "./redact.js";
+
+/**
+ * V100(20261019) yijiakang 【可靠性修复】独立计算完整 Git 状态指纹，避免展示截断、暂存区和提交变化漏检，任务号:20260509145520000648
+ */
+export const verNum = "V100(20261019)";
 
 interface GitContext {
   cwd: string;
@@ -132,34 +138,48 @@ function nearestGitContext(config: CodexProConfig, guard: PathGuard, workspace: 
   return { cwd: root, root, targetPath: normalizeRelPath(path.relative(root, resolved.absPath)) };
 }
 
-function discoverNestedGitContexts(config: CodexProConfig, guard: PathGuard, workspace: Workspace): GitContextDiscovery {
+function discoverNestedGitContexts(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  options: { descendIntoRepositories?: boolean; strict?: boolean } = {}
+): GitContextDiscovery {
   const contexts: GitContext[] = [];
   const queue: Array<{ directory: string; depth: number }> = [{ directory: workspace.root, depth: 0 }];
+  const directoryLimit = options.strict ? config.analysisLimits.maxInventoryFiles : MAX_GIT_DISCOVERY_DIRECTORIES;
+  const repositoryLimit = options.strict ? config.analysisLimits.maxInventoryFiles : MAX_GIT_REPOSITORIES;
   let scannedDirectories = 0;
   let depthLimitReached = false;
 
-  while (queue.length > 0 && scannedDirectories < MAX_GIT_DISCOVERY_DIRECTORIES && contexts.length < MAX_GIT_REPOSITORIES) {
+  while (queue.length > 0 && scannedDirectories < directoryLimit && contexts.length < repositoryLimit) {
     const current = queue.shift();
     if (!current) break;
     scannedDirectories += 1;
 
-    // .git 既可能是目录，也可能是 worktree 使用的文本文件；找到后不再进入仓库内部扫描。
+    // 常规展示找到仓库后停止下钻；指纹必须继续寻找内嵌仓库，不能遗漏它们的 HEAD/index。
     if (current.depth > 0 && fs.existsSync(path.join(current.directory, ".git"))) {
       try {
         const root = fs.realpathSync.native(current.directory);
         const allowed = config.allowedRoots.some((allowedRoot) => isSubpath(root, allowedRoot));
-        if (allowed && isSubpath(root, workspace.root) && gitRootAt(config, root) === root) {
+        const probedRoot = options.strict
+          ? fs.realpathSync.native(fingerprintGitOutput(config, { cwd: root, root }, ["rev-parse", "--show-toplevel"]).toString("utf8").trim())
+          : gitRootAt(config, root);
+        if (allowed && isSubpath(root, workspace.root) && probedRoot === root) {
           contexts.push({ cwd: root, root });
+        } else if (options.strict) {
+          throw new CodexProError(`Cannot fingerprint an invalid or inaccessible Git repository: ${root}`);
         }
-      } catch {
+      } catch (error) {
+        if (options.strict) throw error;
         // 忽略扫描期间消失、无权限或损坏的目录，继续发现其他可用仓库。
       }
-      continue;
+      if (!options.descendIntoRepositories) continue;
     }
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(current.directory, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      if (options.strict) throw new CodexProError(`Cannot fingerprint an unreadable directory: ${current.directory}: ${error instanceof Error ? error.message : String(error)}`);
       continue;
     }
     entries.sort((left, right) => left.name.localeCompare(right.name));
@@ -168,7 +188,8 @@ function discoverNestedGitContexts(config: CodexProConfig, guard: PathGuard, wor
       const directory = path.join(current.directory, entry.name);
       const relPath = normalizeRelPath(path.relative(workspace.root, directory));
       if (guard.isBlockedRelativePath(relPath)) continue;
-      if (current.depth >= MAX_GIT_DISCOVERY_DEPTH) {
+      // 指纹按总目录预算控制遍历，正常的深层 Java 包不能被展示用的深度上限拒绝。
+      if (!options.strict && current.depth >= MAX_GIT_DISCOVERY_DEPTH) {
         depthLimitReached = true;
         continue;
       }
@@ -180,11 +201,11 @@ function discoverNestedGitContexts(config: CodexProConfig, guard: PathGuard, wor
   if (depthLimitReached) {
     warnings.push(`Git repository discovery reached the maximum depth of ${MAX_GIT_DISCOVERY_DEPTH}; deeper repositories were not scanned.`);
   }
-  if (scannedDirectories >= MAX_GIT_DISCOVERY_DIRECTORIES && queue.length > 0) {
-    warnings.push(`Git repository discovery reached the ${MAX_GIT_DISCOVERY_DIRECTORIES}-directory limit; results are truncated.`);
+  if (scannedDirectories >= directoryLimit && queue.length > 0) {
+    warnings.push(`Git repository discovery reached the ${directoryLimit}-directory limit; results are truncated.`);
   }
-  if (contexts.length >= MAX_GIT_REPOSITORIES && queue.length > 0) {
-    warnings.push(`Git repository discovery reached the ${MAX_GIT_REPOSITORIES}-repository limit; results are truncated.`);
+  if (contexts.length >= repositoryLimit && queue.length > 0) {
+    warnings.push(`Git repository discovery reached the ${repositoryLimit}-repository limit; results are truncated.`);
   }
   return {
     contexts: contexts.sort((left, right) => left.root.localeCompare(right.root)),
@@ -210,6 +231,97 @@ function gitContexts(config: CodexProConfig, guard: PathGuard, workspace: Worksp
 
 function repositoryLabel(context: GitContext, workspace: Workspace): string {
   return normalizeRelPath(path.relative(workspace.root, context.root));
+}
+
+export interface GitFingerprintInputs {
+  digest: string;
+  untrackedPaths: string[];
+  repositoryRoots: string[];
+  scannedBytes: number;
+}
+
+function fingerprintGitOutput(
+  config: CodexProConfig,
+  context: GitContext,
+  args: string[],
+  allowedExitCodes = [0]
+): Buffer {
+  const result = spawnSync(gitExecutable(config), args, {
+    cwd: context.cwd,
+    // 指纹预算与 MCP 展示上限独立；超预算直接失败，绝不哈希被截断的输出或错误文本。
+    maxBuffer: Math.max(1_024, config.analysisLimits.maxScannedBytes),
+    timeout: 30_000,
+    env: { ...process.env, NO_COLOR: "1", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+    windowsHide: true
+  });
+  if (result.error || result.status === null || !allowedExitCodes.includes(result.status)) {
+    const detail = result.error?.message ?? String(result.stderr ?? `Git exited with status ${result.status}`);
+    throw new CodexProError(`Cannot compute workspace fingerprint: Git ${args[0]} failed: ${redactSensitiveText(detail).slice(0, 1_000)}`);
+  }
+  return result.stdout ?? Buffer.alloc(0);
+}
+
+function hasAncestorGitMetadata(directory: string): boolean {
+  let current = directory;
+  while (true) {
+    try {
+      fs.lstatSync(path.join(current, ".git"));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+export function gitFingerprintInputs(config: CodexProConfig, guard: PathGuard, workspace: Workspace): GitFingerprintInputs | undefined {
+  // 一次快照复用同一可执行文件，避免 Windows 为每条 Git 命令重复探测 Bash/PATH。
+  const fingerprintConfig = config.gitExecutable ? config : { ...config, gitExecutable: gitExecutable(config) };
+  const rootContext = defaultGitContext(workspace);
+  // 无 Git 是正常项目形态；存在 .git 元数据却不能读取时必须报错，不能降级为“状态未变”。
+  const rootIsRepository = hasAncestorGitMetadata(workspace.root);
+  if (rootIsRepository) fingerprintGitOutput(fingerprintConfig, rootContext, ["rev-parse", "--show-toplevel"]);
+  const discovery = discoverNestedGitContexts(fingerprintConfig, guard, workspace, { descendIntoRepositories: true, strict: true });
+  if (discovery.truncated) {
+    throw new CodexProError(`Cannot compute workspace fingerprint: Git repository discovery is incomplete. ${discovery.warnings.join(" ")}`);
+  }
+  const contexts = rootIsRepository ? [rootContext, ...discovery.contexts] : discovery.contexts;
+  if (contexts.length === 0) return undefined;
+
+  const hash = createHash("sha256");
+  const untrackedPaths = new Set<string>();
+  let outputBytes = 0;
+  for (const context of contexts) {
+    hash.update(repositoryLabel(context, workspace)).update("\0");
+    // 逻辑 index 不包含 mtime 等缓存元数据，git status 刷新不会让未变的工作区误报 stale。
+    const commands = [
+      ["rev-parse", "--verify", "--quiet", "HEAD"],
+      ["ls-files", "--stage", "-z", "--", "."],
+      ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--", "."],
+      ["ls-files", "--others", "--exclude-standard", "-z", "--", "."]
+    ];
+    for (let index = 0; index < commands.length; index += 1) {
+      const output = fingerprintGitOutput(fingerprintConfig, context, commands[index], index === 0 ? [0, 1] : [0]);
+      outputBytes += output.byteLength;
+      if (outputBytes > config.analysisLimits.maxScannedBytes) {
+        throw new CodexProError("Cannot compute workspace fingerprint: Git state byte budget exceeded.");
+      }
+      hash.update(String(index)).update("\0").update(String(output.byteLength)).update("\0").update(output).update("\0");
+      if (index === 3) {
+        for (const relative of output.toString("utf8").split("\0").filter(Boolean)) {
+          untrackedPaths.add(normalizeRelPath(path.relative(workspace.root, path.resolve(context.cwd, relative))));
+        }
+      }
+    }
+  }
+  return {
+    digest: hash.digest("hex"),
+    untrackedPaths: [...untrackedPaths].sort(),
+    repositoryRoots: contexts.map((context) => context.root),
+    scannedBytes: outputBytes
+  };
 }
 
 function boundedGitOutput(sections: string[], maxOutputBytes: number): string {

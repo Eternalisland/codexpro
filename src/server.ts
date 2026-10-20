@@ -19,12 +19,17 @@ import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession, readCodexSessionAround, searchCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
+import { redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import type { ProtocolTraceManager } from "./protocolTrace.js";
 import { createConsoleToolReporter, currentConsoleRequestId, reportCurrentToolProgress } from "./consoleDiagnostics.js";
+
+/**
+ * V100(20261019) yijiakang 【可靠性修复】隔离工具 Trace 故障并统一注册权限策略，任务号:20260509145520000648
+ */
+const verNum = "V100(20261019)";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -296,28 +301,29 @@ function registerToolCompat(
     const started = Date.now();
     const trace = protocolTraceManagersByServer.get(server as object);
     const consoleRequestId = trace?.current()?.requestId ?? currentConsoleRequestId();
-    const span = trace ? await trace.toolStart(name, args ?? {}) : undefined;
+    // Trace is an observer: failures before/after a real tool must not change its result.
+    const span = trace ? await trace.bestEffort(() => trace.toolStart(name, args ?? {})) : undefined;
     const reporter = createConsoleToolReporter(name, args ?? {}, started, consoleRequestId);
     try {
       const result = tagToolResult(await reporter.run(() => handler(args ?? {})), name, options, config);
       const status = result?.isError ? "error" : "ok";
       reporter.finish(status);
       if (trace && span) {
-        await trace.toolEnd({ tool: name, spanId: span.spanId, startedAtMs: span.startedAtMs, status, result });
+        await trace.bestEffort(() => trace.toolEnd({ tool: name, spanId: span.spanId, startedAtMs: span.startedAtMs, status, result }));
       }
       return result;
     } catch (error) {
       const result = tagToolResult(errorResult(error), name, options, config);
       reporter.finish("error");
       if (trace && span) {
-        await trace.toolEnd({
+        await trace.bestEffort(() => trace.toolEnd({
           tool: name,
           spanId: span.spanId,
           startedAtMs: span.startedAtMs,
           status: "error",
           result,
           error
-        });
+        }));
       }
       return result;
     }
@@ -482,8 +488,6 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   return names;
 }
 
-const MINIMAL_TOOLS = new Set<string>(MINIMAL_TOOL_NAMES);
-const STANDARD_TOOLS = new Set<string>(STANDARD_TOOL_NAMES);
 const registeredToolNamesByServer = new WeakMap<object, string[]>();
 
 function rememberRegisteredTool(server: McpServer, name: string): void {
@@ -498,16 +502,8 @@ function registeredToolNames(server: McpServer): string[] {
 }
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
-  if (config.connectionTest && (CONNECTION_TEST_HIDDEN_TOOLS.has(name) || ["run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"].includes(name))) return false;
-  if ((name === "bash" || ["run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"].includes(name)) && config.bashMode === "off") return false;
-  if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
-  if (name === "codex_sessions") return config.codexSessions !== "off";
-  if (name === "read_codex_session") return config.codexSessions === "read";
-  if ((name === "inspect_workspace" || ["run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"].includes(name)) && !config.analysisEnabled) return false;
-  if (name === "handoff_to_agent" && config.writeMode === "handoff") return true;
-  if (config.toolMode === "full") return true;
-  if (config.toolMode === "minimal") return MINIMAL_TOOLS.has(name);
-  return STANDARD_TOOLS.has(name);
+  // Registration and self-test must use the same policy, including opt-in session tools.
+  return toolNamesForMode(config).includes(name);
 }
 
 function registerCodexTool(
@@ -701,9 +697,6 @@ async function applyWorkspacePatch(
   if (!patch.trim()) throw new CodexProError("patch is required.");
   if (Buffer.byteLength(patch, "utf8") > config.maxWriteBytes) {
     throw new CodexProError(`Patch is too large. Limit: ${config.maxWriteBytes} bytes.`);
-  }
-  if (hasSecretValue(patch)) {
-    throw new CodexProError("Secret-looking content is blocked from apply_patch. Use placeholders such as [REDACTED_SECRET].");
   }
   if (patchHasSymlinkMode(patch)) {
     throw new CodexProError("Symlink patches are blocked from apply_patch.");
