@@ -17,6 +17,8 @@ export interface ProtocolTraceConfig {
 export interface ProtocolTraceContext {
   traceId: string;
   requestId: string;
+  taskId?: string;
+  conversationId?: string;
   jsonrpcId?: string | number | null;
   mcpMethod?: string;
   tool?: string;
@@ -58,6 +60,12 @@ function newSpanId(): string {
   return `sp_${randomBytes(8).toString("hex")}`;
 }
 
+// An external task id is explicit correlation metadata, never inferred from a session or timestamp.
+export function validTaskId(input: unknown): string | undefined {
+  return typeof input === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/.test(input)
+    ? input : undefined;
+}
+
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
 }
@@ -71,6 +79,8 @@ function truncateUtf8(value: string, maxBytes: number): string {
 }
 
 function traceSensitiveKey(key: string): boolean {
+  // Preserve only conversation_id digests, not the host's raw session metadata.
+  if (key === "openai/session") return true;
   const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
   return /(?:authorization|cookie|password|passwd|apikey|privatekey|clientsecret|token|secret)$/.test(normalized);
 }
@@ -335,6 +345,7 @@ export class ProtocolTraceManager {
     requestId: string;
     body: unknown;
     sessionId?: string;
+    taskId?: string;
     httpMethod?: string;
   }): ProtocolTraceContext {
     const body =
@@ -345,6 +356,15 @@ export class ProtocolTraceManager {
       body.params && typeof body.params === "object" && !Array.isArray(body.params)
         ? body.params as Record<string, unknown>
         : {};
+    const meta = params._meta && typeof params._meta === "object" && !Array.isArray(params._meta)
+      ? params._meta as Record<string, unknown> : {};
+    const taskId = validTaskId(input.taskId) ?? validTaskId(meta["codexpro/task_id"]);
+    // ChatGPT may provide an anonymized conversation id. Persist only a digest,
+    // never the original host-provided identifier or a derived task boundary.
+    const chatSession = meta["openai/session"];
+    const conversationId = typeof chatSession === "string" && chatSession.length > 0 &&
+      chatSession.length <= 256 && !/[\x00-\x1f\x7f]/.test(chatSession)
+      ? hashTraceIdentifier("openai/session:" + chatSession) : undefined;
     const method = typeof body.method === "string" ? body.method : undefined;
     const tool = method === "tools/call" && typeof params.name === "string" ? params.name : undefined;
     const id =
@@ -354,6 +374,8 @@ export class ProtocolTraceManager {
     return {
       traceId: newTraceId(),
       requestId: input.requestId,
+      ...(taskId ? { taskId } : {}),
+      ...(conversationId ? { conversationId } : {}),
       ...(id !== undefined ? { jsonrpcId: id } : {}),
       ...(method ? { mcpMethod: method } : {}),
       ...(tool ? { tool } : {}),
@@ -561,6 +583,8 @@ export class ProtocolTraceManager {
     return {
       trace_id: ctx.traceId,
       request_id: ctx.requestId,
+      ...(ctx.taskId ? { task_id: ctx.taskId } : {}),
+      ...(ctx.conversationId ? { conversation_id: ctx.conversationId } : {}),
       ...(ctx.jsonrpcId !== undefined ? { jsonrpc_id: ctx.jsonrpcId } : {}),
       ...(ctx.mcpMethod ? { mcp_method: ctx.mcpMethod } : {}),
       ...(ctx.mcpSession ? { mcp_session: ctx.mcpSession } : {}),

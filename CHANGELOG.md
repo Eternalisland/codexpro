@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Fixed Eclipse JDT LS workspace initialization by supplying `initializationOptions.workspaceFolders` in addition to standard LSP `workspaceFolders`, with Maven import enabled and mock-protocol validation; confirmed with a real JDT LS 1.62.0 and JDK 25 on a disposable Maven workspace.
+- Fixed optional JDT LS selection on large Java repositories: select declarations from the requested file instead of requiring the bounded workspace-wide heuristic index, accept hierarchical/flat/empty LSP document symbols, and report sanitized JDT protocol diagnostics. Added overload, limited-budget and empty-symbol regression cases; isolate ordinary MCP smoke tests from machine-wide JDT settings.
+- Added optional on-demand Eclipse JDT LS backend for Java symbol/reference resolution, implementations, and type hierarchy. Uses bounded stdio LSP, per-workspace process reuse, document sync, idle shutdown, and explicit fallback to inferred results when unavailable; mock protocol integration tests added.
+- Extended `find_symbol`/`find_references` with bounded Java method/overload source parsing and conservative receiver/arity-based call lookup; explicitly mark results as inferred and report unresolved/ambiguous references. No new Java runtime dependency.
+- Added compiler-backed `find_symbol` and `find_references` tools for TypeScript/JavaScript (with TypeScript as a runtime dependency), with source locations, alias/member resolution, ambiguity handling, scope limits, and explicit coverage warnings; other languages remain heuristic-only.
+- Added read-only `preview_patch` for unified diffs, reusing apply_patch path checks and Git applicability validation, with dirty-target warnings, conflict reasons, and no source writes.
+- Added automatic ChatGPT conversation-scoped Agent playback using optional MCP `openai/session` metadata; only SHA-256 digests are persisted, with request-payload redaction and no inferred task boundaries.
+- Added explicit task_id correlation across MCP HTTP requests (header or request metadata) and task-scoped playback in Trace Explorer; never infer task boundaries from sessions or timestamps.
+- Added request-scoped Agent execution timeline to the local Trace Explorer, with command results, bounded redacted output, managed-check events, failures, and links to file diffs; this does not expose hidden ChatGPT reasoning.
+- Added independent file-list and revision-history collapsing in the live Trace Explorer, plus viewport-wide focused Diff review with Escape-to-exit and layout-state restoration.
+- Fixed overlapping code in the Trace Explorer split diff by using shared content-sized columns and keeping long lines horizontally scrollable.
+- Improved local Trace Explorer accuracy for multi-file patches with file-scoped diffs and per-file change counts; added unified/split views, horizontal code scrolling, and inline changed-character highlighting.
 - Allowed `write`, `edit`, and `apply_patch` to persist credential-shaped source text without blocking; retained output/trace redaction, workspace path restrictions, and write safeguards. Do not commit real credentials to source control.
 - Rejected invalid UTF-8 in text reads and existing-file writes/edits to prevent lossy decoding from corrupting file contents, while preserving valid UTF-8 BOMs and line endings.
 - Strengthened verification fingerprints to cover complete relevant content and refuse check recovery or resume when workspace state cannot be verified reliably.

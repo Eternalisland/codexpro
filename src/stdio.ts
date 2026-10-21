@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { loadConfig } from "./config.js";
 import { createCodexProServer } from "./server.js";
 import { ManagedCheckManager } from "./checkJobOps.js";
+import { shutdownJdtClients } from "./analysis/jdtClient.js";
 import { CODEXPRO_VERSION } from "./version.js";
 
 function printHelp(): void {
@@ -33,19 +34,20 @@ async function main(): Promise<void> {
   const server = createCodexProServer(config, { managedCheckManager });
   const transport = new StdioServerTransport();
   let shuttingDown = false;
-  const shutdown = async (signal: NodeJS.Signals) => {
+  const shutdown = async (reason: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.error(`[CodexPro] ${signal} received; stopping managed checks before shutdown.`);
+    console.error(`[CodexPro] ${reason}; stopping managed checks before shutdown.`);
     const checks = await managedCheckManager.shutdown(7_500);
     if (!checks.settled) {
       console.error("[CodexPro] managed check shutdown exceeded the grace period.");
-      process.exit(1);
     }
-    process.exit(0);
+    await shutdownJdtClients();
+    process.exit(checks.settled ? 0 : 1);
   };
   process.once("SIGINT", () => void shutdown("SIGINT"));
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
+  process.stdin.once("end", () => void shutdown("stdin closed"));
   await server.connect(transport);
 }
 

@@ -20,6 +20,7 @@ import {
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
 import { ManagedCheckManager } from "./checkJobOps.js";
+import { shutdownJdtClients } from "./analysis/jdtClient.js";
 import { WorkspaceRegistry } from "./guard.js";
 import { ProtocolTraceManager, SseFrameInspector } from "./protocolTrace.js";
 import { redactConfigPaths } from "./pathLabels.js";
@@ -103,6 +104,8 @@ async function withMcpProtocolTrace(
     requestId,
     body: req.body,
     sessionId,
+    taskId: typeof req.headers["x-codexpro-task-id"] === "string"
+      ? req.headers["x-codexpro-task-id"] : undefined,
     httpMethod: req.method
   });
   let sseInspector: SseFrameInspector | undefined;
@@ -2082,6 +2085,7 @@ async function main(): Promise<void> {
     await new Promise<void>((resolve) => {
       httpServer.close(() => resolve());
     });
+    await shutdownJdtClients();
     process.exitCode = 0;
   };
   process.once("SIGINT", () => void shutdown("SIGINT"));

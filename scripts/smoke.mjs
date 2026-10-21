@@ -4,6 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 
 process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = '1';
+// General MCP smoke fixtures must not inherit an installed, on-demand Java language server.
+// Real LSP behavior is covered separately by jdt-smoke.mjs and manual integration checks.
+process.env.CODEXPRO_JDTLS_HOME = '';
 
 function encode(message) {
   return `${JSON.stringify(message)}\n`;
@@ -173,6 +176,15 @@ await fs.writeFile(path.join(tmp, 'package.json'), JSON.stringify({
 }, null, 2), 'utf8');
 await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
 await fs.writeFile(path.join(tmp, 'src', 'auth.ts'), 'export function authenticate(user) { return Boolean(user); }\n', 'utf8');
+await fs.mkdir(path.join(tmp, 'java', 'example'), { recursive: true });
+await fs.writeFile(path.join(tmp, 'java', 'example', 'Navigator.java'), [
+  'package example;',
+  'public class Navigator {',
+  '  public void lookup(String id) { }',
+  '  public void lookup(String id, int attempt) { }',
+  '  void use() { lookup("a", 2); }',
+  '}'
+].join('\n') + '\n', 'utf8');
 await fs.mkdir(path.join(tmp, 'test'), { recursive: true });
 await fs.writeFile(path.join(tmp, 'test', 'auth.test.ts'), "import { authenticate } from '../src/auth.js';\nvoid authenticate('test');\n", 'utf8');
 await fs.writeFile(path.join(tmp, 'é.ts'), 'export const accent = 1;\n', 'utf8');
@@ -227,7 +239,8 @@ const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--al
     CODEXPRO_ALLOWED_ROOTS: [tmp, alternateWorkspace].join(path.delimiter),
     CODEXPRO_BASH_TRANSCRIPT: 'compact',
     CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test',
-    CODEXPRO_TOOL_CARDS: '0'
+    CODEXPRO_TOOL_CARDS: '0',
+    CODEXPRO_JDTLS_HOME: ''
   }
 });
 
@@ -239,7 +252,7 @@ await client.request('initialize', {
 client.notify('notifications/initialized');
 const tools = await client.request('tools/list', {});
 const toolNames = tools.tools.map((tool) => tool.name);
-for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'inspect_workspace', 'find_symbol', 'find_references', 'find_implementations', 'get_type_hierarchy', 'tree', 'search', 'load_skill', 'read', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
   if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
 }
 const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
@@ -331,6 +344,68 @@ if (spawnSync(process.platform === 'win32' ? 'where' : 'sh', process.platform ==
   if (!cardRegexSearch.structuredContent.matches?.length || cardRegexSearch.structuredContent.used !== 'ripgrep') {
     throw new Error(`ripgrep regex search did not accept rg syntax: ${JSON.stringify(cardRegexSearch.structuredContent)}`);
   }
+}
+const cardSymbol = await cardClient.request('tools/call', {
+  name: 'find_symbol',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id, symbol: 'authenticate' }
+});
+if (cardSymbol.isError || !cardSymbol.structuredContent.definitions?.some((item) =>
+    item.path === 'src/auth.ts' && item.line > 0 && item.column > 0)) {
+  throw new Error('find_symbol MCP response did not expose source location: ' + JSON.stringify(cardSymbol.structuredContent));
+}
+const cardRefs = await cardClient.request('tools/call', {
+  name: 'find_references',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id,
+    symbol: 'authenticate', path: 'src/auth.ts', include_tests: true }
+});
+if (cardRefs.isError || cardRefs.structuredContent.ambiguous ||
+    !cardRefs.structuredContent.references?.some((item) => item.path === 'src/auth.ts' && item.is_definition) ||
+    !cardRefs.structuredContent.references?.some((item) => item.path === 'test/auth.test.ts')) {
+  throw new Error('find_references MCP response omitted semantic callers: ' + JSON.stringify(cardRefs.structuredContent));
+}
+const javaSymbol = await cardClient.request('tools/call', {
+  name: 'find_symbol',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id,
+    symbol: 'Navigator.lookup', path: 'java/example/Navigator.java' }
+});
+if (javaSymbol.isError || javaSymbol.structuredContent?.total !== 2 ||
+    !javaSymbol.structuredContent.definitions?.every(d => d.source === 'java-source-heuristic')) {
+  throw new Error('Java method declarations did not resolve: ' + JSON.stringify(javaSymbol.structuredContent));
+}
+const javaAmbiguous = await cardClient.request('tools/call', {
+  name: 'find_references',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id,
+    symbol: 'Navigator.lookup', path: 'java/example/Navigator.java' }
+});
+if (javaAmbiguous.isError || javaAmbiguous.structuredContent?.ambiguous !== true ||
+    javaAmbiguous.structuredContent?.references?.length !== 0) {
+  throw new Error('Java overload ambiguity must be explicit: ' + JSON.stringify(javaAmbiguous.structuredContent));
+}
+const javaRefs = await cardClient.request('tools/call', {
+  name: 'find_references',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id,
+    symbol: 'Navigator.lookup', path: 'java/example/Navigator.java',
+    parameter_types: ['String', 'int'] }
+});
+if (javaRefs.isError || javaRefs.structuredContent?.ambiguous ||
+    !javaRefs.structuredContent.references?.some(x => x.path === 'java/example/Navigator.java' &&
+      x.line === 5 && x.source === 'java-source-heuristic')) {
+  throw new Error('Java MCP overload references missing: ' + JSON.stringify(javaRefs.structuredContent));
+}
+const noJdtImplementations = await cardClient.request('tools/call', {
+  name: 'find_implementations',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id,
+    symbol: 'Navigator', path: 'java/example/Navigator.java' }
+});
+const noJdtHierarchy = await cardClient.request('tools/call', {
+  name: 'get_type_hierarchy',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id,
+    symbol: 'Navigator', path: 'java/example/Navigator.java', direction: 'both' }
+});
+if (noJdtImplementations.isError || noJdtHierarchy.isError ||
+    noJdtImplementations.structuredContent?.status !== 'unavailable' ||
+    noJdtHierarchy.structuredContent?.status !== 'unavailable') {
+  throw new Error('Unconfigured JDT LS should produce explicit unavailable results');
 }
 await cardClient.close();
 if (spawnSync(process.platform === 'win32' ? 'where' : 'sh', process.platform === 'win32' ? ['rg'] : ['-lc', 'command -v rg >/dev/null 2>&1']).status === 0) {
@@ -833,6 +908,45 @@ if ('analysis' in repeatedChanges.structuredContent) {
   throw new Error(`show_changes recomputed analysis for an unchanged checkpoint: ${JSON.stringify(repeatedChanges.structuredContent.analysis)}`);
 }
 await client.request('tools/call', { name: 'edit', arguments: { workspace_id: ws, path: 'other.txt', old_text: 'keep', new_text: 'unrelated dirty file' } });
+const previewCandidate = [
+  'diff --git a/demo.txt b/demo.txt',
+  '--- a/demo.txt', '+++ b/demo.txt', '@@ -1,4 +1,4 @@',
+  ' alpha', ' read', ' write', '-omega', '+omega patched',
+  'diff --git a/other.txt b/other.txt',
+  '--- a/other.txt', '+++ b/other.txt', '@@ -1 +1 @@',
+  '-unrelated dirty file', '+preview should not write'
+].join('\n') + '\n';
+const beforePreviewDemo = await fs.readFile(path.join(tmp, 'demo.txt'), 'utf8');
+const beforePreviewOther = await fs.readFile(path.join(tmp, 'other.txt'), 'utf8');
+const previewResult = await client.request('tools/call', {
+  name: 'preview_patch', arguments: { workspace_id: ws, patch: previewCandidate }
+});
+if (previewResult.isError || !previewResult.structuredContent?.can_apply ||
+    previewResult.structuredContent.changed !== false ||
+    previewResult.structuredContent.additions !== 2 ||
+    previewResult.structuredContent.deletions !== 2 ||
+    !previewResult.structuredContent.paths?.includes('demo.txt') ||
+    !previewResult.structuredContent.paths?.includes('other.txt') ||
+    !previewResult.structuredContent.dirty_paths?.includes('demo.txt') ||
+    !previewResult.structuredContent.dirty_paths?.includes('other.txt') ||
+    (await fs.readFile(path.join(tmp, 'demo.txt'), 'utf8')) !== beforePreviewDemo ||
+    (await fs.readFile(path.join(tmp, 'other.txt'), 'utf8')) !== beforePreviewOther) {
+  throw new Error('preview_patch must validate both files without writing: ' +
+    JSON.stringify(previewResult.structuredContent));
+}
+const stalePreview = await client.request('tools/call', {
+  name: 'preview_patch', arguments: { workspace_id: ws,
+    patch: previewCandidate.replace('-omega', '-stale old context') }
+});
+if (stalePreview.isError || stalePreview.structuredContent?.can_apply !== false ||
+    !stalePreview.structuredContent?.reason ||
+    (await fs.readFile(path.join(tmp, 'demo.txt'), 'utf8')) !== beforePreviewDemo) {
+  throw new Error('preview_patch must report context conflicts without changing source');
+}
+await expectToolError('preview_patch', { workspace_id: ws, patch: [
+  'diff --git a/.env b/.env', '--- /dev/null', '+++ b/.env',
+  '@@ -0,0 +1 @@', '+PLACEHOLDER=1'
+].join('\n') + '\n' }, /blocked/i);
 const patchResult = await client.request('tools/call', {
   name: 'apply_patch',
   arguments: {

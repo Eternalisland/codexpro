@@ -21,6 +21,8 @@ import { listCodexSessions, readCodexSession, readCodexSessionAround, searchCode
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
+import { findWorkspaceSymbol, findWorkspaceReferences } from "./analysis/symbolNavigation.js";
+import { jdtImplementations, jdtHierarchy } from "./analysis/jdtNavigation.js";
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import type { ProtocolTraceManager } from "./protocolTrace.js";
@@ -363,6 +365,7 @@ const MINIMAL_TOOL_NAMES = [
   "read_many",
   "write",
   "edit",
+  "preview_patch",
   "apply_patch",
   "import_file",
   "bash",
@@ -380,6 +383,10 @@ const MINIMAL_TOOL_NAMES = [
 const STANDARD_TOOL_NAMES = [
   ...MINIMAL_TOOL_NAMES,
   "inspect_workspace",
+  "find_symbol",
+  "find_references",
+  "find_implementations",
+  "get_type_hierarchy",
   "tree",
   "search",
   "load_skill",
@@ -401,6 +408,10 @@ const FULL_TOOL_NAMES = [
   "open_workspace",
   "workspace_snapshot",
   "inspect_workspace",
+  "find_symbol",
+  "find_references",
+  "find_implementations",
+  "get_type_hierarchy",
   "tree",
   "search",
   "read",
@@ -408,6 +419,7 @@ const FULL_TOOL_NAMES = [
   "view_image",
   "write",
   "edit",
+  "preview_patch",
   "apply_patch",
   "import_file",
   "bash",
@@ -435,6 +447,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "codexpro_self_test",
   "write",
   "edit",
+  "preview_patch",
   "apply_patch",
   "import_file",
   "bash",
@@ -464,14 +477,14 @@ function toolNamesForMode(config: CodexProConfig): string[] {
     }
   }
   if (config.writeMode !== "workspace") {
-    for (const writeTool of ["write", "edit", "apply_patch", "import_file"]) {
+    for (const writeTool of ["write", "edit", "preview_patch", "apply_patch", "import_file"]) {
       const toolIndex = names.indexOf(writeTool);
       if (toolIndex !== -1) names.splice(toolIndex, 1);
     }
   }
   if (config.writeMode === "handoff" && !names.includes("handoff_to_agent")) names.push("handoff_to_agent");
   if (!config.analysisEnabled) {
-    for (const analysisTool of ["inspect_workspace", "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
+    for (const analysisTool of ["inspect_workspace", "find_symbol", "find_references", "find_implementations", "get_type_hierarchy", "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
       const analysisIndex = names.indexOf(analysisTool);
       if (analysisIndex !== -1) names.splice(analysisIndex, 1);
     }
@@ -688,12 +701,12 @@ function patchTouchedPaths(patch: string): string[] {
   return [...paths];
 }
 
-async function applyWorkspacePatch(
+function validateWorkspacePatchInput(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
   patch: string
-): Promise<{ paths: string[]; stdout: string; stderr: string; diff: string; additions: number; deletions: number; changed: boolean }> {
+): { paths: string[]; absPaths: string[] } {
   if (!patch.trim()) throw new CodexProError("patch is required.");
   if (Buffer.byteLength(patch, "utf8") > config.maxWriteBytes) {
     throw new CodexProError(`Patch is too large. Limit: ${config.maxWriteBytes} bytes.`);
@@ -709,23 +722,89 @@ async function applyWorkspacePatch(
     absPaths.push(guard.resolve(workspace, touchedPath, { forWrite: true }).absPath);
     assertWriteToolAllowed(config, touchedPath);
   }
+  return { paths, absPaths };
+}
 
+function checkWorkspacePatch(
+  config: CodexProConfig,
+  workspace: Workspace,
+  patch: string
+): { canApply: boolean; reason: string; stdout: string; stderr: string } {
+  const check = spawnSync("git", ["apply", "--check", "--verbose", "--whitespace=nowarn"], {
+    cwd: workspace.root,
+    input: patch,
+    encoding: "utf8",
+    maxBuffer: config.maxOutputBytes,
+    env: { ...process.env, NO_COLOR: "1" }
+  });
+  const output = [check.stdout?.trim(), check.stderr?.trim()].filter(Boolean).join("\n");
+  const canApply = !check.error && check.status === 0 && !/(?:^|\n)Skipped patch\b/i.test(output);
+  return {
+    canApply,
+    reason: canApply ? "" : redactSensitiveText(output || check.error?.message || "git apply --check failed"),
+    stdout: redactSensitiveText(check.stdout?.trim() || ""),
+    stderr: redactSensitiveText(check.stderr?.trim() || "")
+  };
+}
+
+async function previewWorkspacePatch(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  patch: string
+): Promise<{ paths: string[]; can_apply: boolean; changed: false; reason: string;
+  dirty_paths: string[]; warnings: string[]; additions: number; deletions: number; diff: string }> {
+  const { paths, absPaths } = validateWorkspacePatchInput(config, guard, workspace, patch);
+  return withFileWriteLocks(absPaths, () => {
+    // Repeat path checks after acquiring the same locks as apply_patch.
+    for (const touchedPath of paths) {
+      guard.resolve(workspace, touchedPath, { forWrite: true });
+      assertWriteToolAllowed(config, touchedPath);
+    }
+    const checked = checkWorkspacePatch(config, workspace, patch);
+    const status = spawnSync("git", ["status", "--porcelain=v1", "-z",
+      "--untracked-files=all", "--", ...paths], {
+      cwd: workspace.root, encoding: "utf8", maxBuffer: config.maxOutputBytes,
+      env: { ...process.env, NO_COLOR: "1" }
+    });
+    const warnings: string[] = [];
+    const dirtyPaths = status.status === 0 && !status.error
+      ? [...new Set(status.stdout.split("\0").filter((record) => record.length > 3 && record[2] === " ")
+        .map((record) => record.slice(3)).filter((file) => paths.includes(file)))]
+      : [];
+    if (status.error || status.status !== 0) {
+      warnings.push("Could not determine which target files contain staged, unstaged, or untracked changes.");
+    }
+    if (dirtyPaths.length) {
+      warnings.push("Target files contain existing Git changes. Inspect these changes before applying.");
+    }
+    warnings.push("Preview is advisory: external changes after this check can invalidate the result.");
+    const diff = redactSensitiveText(patch.trimEnd());
+    const stats = diffStats(diff);
+    return {
+      paths, can_apply: checked.canApply, changed: false, reason: checked.reason,
+      dirty_paths: dirtyPaths, warnings,
+      additions: stats.additions, deletions: stats.deletions, diff
+    };
+  });
+}
+
+async function applyWorkspacePatch(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  patch: string
+): Promise<{ paths: string[]; stdout: string; stderr: string; diff: string; additions: number; deletions: number; changed: boolean }> {
+  const { paths, absPaths } = validateWorkspacePatchInput(config, guard, workspace, patch);
   return withFileWriteLocks(absPaths, () => {
     for (const touchedPath of paths) {
       guard.resolve(workspace, touchedPath, { forWrite: true });
       assertWriteToolAllowed(config, touchedPath);
     }
 
-    const check = spawnSync("git", ["apply", "--check", "--verbose", "--whitespace=nowarn"], {
-      cwd: workspace.root,
-      input: patch,
-      encoding: "utf8",
-      maxBuffer: config.maxOutputBytes,
-      env: { ...process.env, NO_COLOR: "1" }
-    });
-    const checkOutput = [check.stdout?.trim(), check.stderr?.trim()].filter(Boolean).join("\n");
-    if (check.error || check.status !== 0 || /(?:^|\n)Skipped patch\b/i.test(checkOutput)) {
-      throw new CodexProError(redactSensitiveText(checkOutput || check.error?.message || "git apply --check failed"));
+    const check = checkWorkspacePatch(config, workspace, patch);
+    if (!check.canApply) {
+      throw new CodexProError(check.reason);
     }
 
     const applied = spawnSync("git", ["apply", "--verbose", "--whitespace=nowarn"], {
@@ -2322,6 +2401,84 @@ export function createCodexProServer(
     }
   );
 
+  // JDT LS is opt-in. These read-only queries never invent an implementation graph.
+  for (const navigation of [
+    { name: "find_implementations", title: "Find Java Implementations",
+      description: "Use optional JDT LS type bindings to locate implementations of a Java interface, class or method." },
+    { name: "get_type_hierarchy", title: "Java Type Hierarchy",
+      description: "Use optional JDT LS to query Java class/interface supertypes and subtypes." }
+  ] as const) {
+    registerCodexTool(config, server, navigation.name, {
+      title: navigation.title, description: navigation.description,
+      inputSchema: {
+        workspace_id: z.string().optional(),
+        symbol: z.string().min(1).max(200).describe("Java class/interface or method name."),
+        path: z.string().min(1).describe("Workspace-relative Java declaration file."),
+        parameter_types: z.array(z.string().min(1)).max(24).optional(),
+        direction: z.enum(["both","supertypes","subtypes"]).optional().describe("Only used by get_type_hierarchy."),
+        include_tests: z.boolean().optional(),
+        max_results: z.number().int().min(1).max(200).optional()
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    }, async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const options = { symbol: args.symbol, path: args.path, parameterTypes: args.parameter_types,
+        includeTests: args.include_tests, maxResults: args.max_results, direction: args.direction };
+      const result = navigation.name === "find_implementations"
+        ? await jdtImplementations(config, guard, workspace, options)
+        : await jdtHierarchy(config, guard, workspace, options);
+      return textResult("# " + navigation.title + "\n" + JSON.stringify(result), {
+        workspace_id: workspace.id, ...result
+      });
+    });
+  }
+
+  // Semantic navigation supports TypeScript and optional JDT-backed Java source files.
+  for (const navigation of [
+    { name: "find_symbol", title: "Find Symbol", description: "Find TypeScript/JavaScript compiler-resolved declarations or Java source-level method declarations, including overload signatures. Java results are heuristic." },
+    { name: "find_references", title: "Find References", description: "Find TypeScript/JavaScript compiler-resolved references or conservative Java method call sites. Specify path and parameter_types to disambiguate Java overloads; Java results are not compiler-exact." }
+  ] as const) {
+    registerCodexTool(config, server, navigation.name, {
+      title: navigation.title,
+      description: navigation.description,
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Defaults to selected workspace."),
+        symbol: z.string().min(1).max(200).regex(/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/)
+          .describe("Identifier or qualified name, e.g. authenticate or UserService.updateUser."),
+        path: z.string().optional().describe("Workspace-relative definition path. Required for ambiguous symbols or Java overload selection."),
+        parameter_types: z.array(z.string().min(1).max(200)).max(24).optional()
+          .describe("Java overload selection, e.g. [\"String\", \"int\"]. For TypeScript/JavaScript this option is ignored."),
+        include_tests: z.boolean().optional().describe("Include test sources. Default: true."),
+        max_results: z.number().int().min(1).max(200).optional().describe("Maximum returned locations. Default: 80.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": navigation.name === "find_symbol" ? "Resolving symbols..." : "Resolving references...",
+        "openai/toolInvocation/invoked": navigation.name === "find_symbol" ? "Symbols resolved" : "References resolved"
+      }
+    }, async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const options = { symbol: args.symbol, path: args.path,
+        parameterTypes: args.parameter_types,
+        includeTests: args.include_tests, maxResults: args.max_results };
+      const result = navigation.name === "find_symbol"
+        ? await findWorkspaceSymbol(config, guard, workspace, options)
+        : await findWorkspaceReferences(config, guard, workspace, options);
+      const locations = ("references" in result ? result.references : result.definitions) as Array<{ path: string; line: number; column: number }>;
+      const lines = [
+        "# " + navigation.title, "",
+        "Symbol: " + args.symbol,
+        "Definitions: " + result.definitions.length,
+        ...("ambiguous" in result && result.ambiguous ? ["Ambiguous: narrow with path."] : []),
+        "Returned locations: " + locations.length,
+        ...(result.truncated ? ["Coverage or results incomplete."] : []),
+        ...locations.slice(0, 20).map((item) => "- " + item.path + ":" + item.line + ":" + item.column),
+        ...result.warnings.slice(0, 6).map((warning) => "Warning: " + warning)
+      ].join("\n");
+      return textResult(lines, { workspace_id: workspace.id, root: workspace.root, ...result });
+    });
+  }
+
   registerCodexTool(
     config,
     server,
@@ -2616,6 +2773,40 @@ export function createCodexProServer(
         changed: result.changed,
         diff: result.diff
       });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "preview_patch",
+    {
+      title: "Preview Patch",
+      description: "Validate a unified diff against current workspace files without writing. Reports Git conflicts, existing changes, touched paths and statistics. Preview is advisory and may become stale.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the selected workspace."),
+        patch: z.string().describe("Unified diff to validate without modifying files.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Checking patch without writing...",
+        "openai/toolInvocation/invoked": "Patch preview ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await previewWorkspacePatch(config, guard, workspace, String(args.patch ?? ""));
+      const summary = [
+        "# Preview Patch", "",
+        `Can apply now: ${result.can_apply ? "yes" : "no"}`,
+        "Source files changed: no",
+        `Paths: ${result.paths.join(", ")}`,
+        `Diff stats: +${result.additions} -${result.deletions}`,
+        result.dirty_paths.length ? `Existing Git changes: ${result.dirty_paths.join(", ")}` : "",
+        result.reason ? `Reason: ${result.reason}` : "",
+        ...result.warnings.map((warning) => `Warning: ${warning}`)
+      ].filter(Boolean).join("\n");
+      return textResult(summary, { workspace_id: workspace.id, root: workspace.root, ...result });
     }
   );
 

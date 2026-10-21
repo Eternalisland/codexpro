@@ -8,6 +8,8 @@ process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = '1';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const importBuilt = (relativePath) => import(pathToFileURL(path.join(projectRoot, 'dist', relativePath)).href);
+const installedManifest = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
+assert.equal(typeof installedManifest.dependencies?.typescript, 'string', 'semantic navigation needs TypeScript in production dependencies');
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-analysis-'));
 const wideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-analysis-wide-'));
 const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-analysis-outside-'));
@@ -28,6 +30,23 @@ try {
   await write('src/auth.ts', 'export function authenticate(user: string) { return Boolean(user); }\n');
   await write('src/race.ts', 'export function temporaryFile() { return true; }\n');
   await write('test/auth.test.ts', "import { authenticate } from '../src/auth.js';\nvoid authenticate('test');\n");
+  await write('src/nav-alpha.ts', [
+    'export function compute(input: number) { return input + 1; }',
+    'export class UserService { updateUser() { return compute(1); } }',
+    'export class OtherService { updateUser() { return 0; } }',
+    '// compute is mentioned in a comment',
+    'export const textOnly = "compute";'
+  ].join('\n') + '\n');
+  await write('src/nav-beta.ts', 'export function compute(input: number) { return input - 1; }\n');
+  await write('src/nav-caller.ts', [
+    "import { compute as calculate, UserService } from './nav-alpha.js';",
+    'export const result = calculate(2);',
+    'new UserService().updateUser();'
+  ].join('\n') + '\n');
+  await write('test/nav.test.ts', [
+    "import { compute } from '../src/nav-alpha.js';",
+    'void compute(3);'
+  ].join('\n') + '\n');
   await write('README.md', '# Fixture\n');
   await write('.env', 'PRIVATE_TOKEN=never-visible\n');
   await write('python/service.py', 'def load_user(user_id):\n    return user_id\n');
@@ -36,6 +55,44 @@ try {
   await write('rust/service.rs', 'pub fn load_user(id: &str) -> &str { id }\n');
   await write('swift/Service.swift', 'public func loadUser(_ id: String) -> String { id }\n');
   await write('java/Service.java', 'public class Service { }\n');
+  await write('java/example/UserService.java', [
+    'package example;',
+    'public class UserService {',
+    '  public String updateUser(String id) { return id; }',
+    '  public String updateUser(String id, int age) { return id; }',
+    '  public static int audit(int value) { return value; }',
+    '  public void process(UserService peer) { peer.updateUser("peer", 1); }',
+    '}'
+  ].join('\n') + '\n');
+  await write('java/example/OtherService.java', [
+    'package example;',
+    'public class OtherService {',
+    '  public String updateUser(String id) { return id; }',
+    '}'
+  ].join('\n') + '\n');
+  await write('java/example/Caller.java', [
+    'package example;',
+    'public class Caller {',
+    '  public void run() {',
+    '    UserService service = new UserService();',
+    '    service.updateUser("Ada", 2);',
+    '    service.updateUser("Bob");',
+    '    OtherService other = new OtherService();',
+    '    other.updateUser("not ours");',
+    '    UserService.audit(5);',
+    '    // service.updateUser("comment", 2);',
+    '    String doc = "service.updateUser(42)";',
+    '  }',
+    '  void missingReceiver() { service.updateUser("scope leak", 1); }',
+    '}'
+  ].join('\n') + '\n');
+  await write('test/java/UserServiceTest.java', [
+    'package example;',
+    'class UserServiceTest {',
+    '  void test() { UserService service = new UserService(); service.updateUser("T", 5); }',
+    '}'
+  ].join('\n') + '\n');
+
   await write('csharp/Service.cs', 'public class Service { }\n');
   await write('c/service.c', 'int load_user(int id) { return id; }\n');
   await write('cpp/service.cpp', 'class Service { };\n');
@@ -127,6 +184,93 @@ try {
   });
   assert(impactSearch.groups.references.some((match) => match.path === 'src/index.ts' && match.reasons.includes('dependent module')));
   assert(impactSearch.groups.tests.some((match) => match.path === 'test/auth.test.ts' && match.reasons.includes('dependent test')));
+
+  const symbolApi = await importBuilt('analysis/symbolNavigation.js');
+  const candidates = await symbolApi.findSymbol(config, guard, workspace, { symbol: 'compute' });
+  assert.equal(candidates.total, 2, 'same-name declarations must remain distinct');
+  assert(candidates.definitions.every((item) => item.line === 1 && item.column > 0));
+  const ambiguous = await symbolApi.findReferences(config, guard, workspace, { symbol: 'compute' });
+  assert.equal(ambiguous.ambiguous, true);
+  assert.equal(ambiguous.references.length, 0, 'ambiguous names must not merge callers');
+  const exactRefs = await symbolApi.findReferences(config, guard, workspace, {
+    symbol: 'compute', path: 'src/nav-alpha.ts', includeTests: true
+  });
+  assert.equal(exactRefs.ambiguous, false);
+  assert(exactRefs.references.some((item) => item.path === 'src/nav-caller.ts' && item.text.includes('calculate')));
+  assert(exactRefs.references.some((item) => item.path === 'test/nav.test.ts'));
+  assert(!exactRefs.references.some((item) => item.path === 'src/nav-beta.ts'));
+  assert(!exactRefs.references.some((item) => item.text.includes('comment') || item.text.includes('textOnly')));
+  const withoutTests = await symbolApi.findReferences(config, guard, workspace, {
+    symbol: 'compute', path: 'src/nav-alpha.ts', includeTests: false
+  });
+  assert(!withoutTests.references.some((item) => item.path.startsWith('test/')));
+  const methods = await symbolApi.findSymbol(config, guard, workspace, { symbol: 'UserService.updateUser' });
+  assert.equal(methods.total, 1);
+  const methodRefs = await symbolApi.findReferences(config, guard, workspace, { symbol: 'UserService.updateUser' });
+  assert(methodRefs.references.some((item) => item.path === 'src/nav-caller.ts'), JSON.stringify(methodRefs));
+  assert(!methodRefs.references.some((item) => item.path === 'src/nav-alpha.ts' && item.line === 3));
+  const javaApi = await importBuilt('analysis/javaNavigation.js');
+  const javaSymbols = await javaApi.findJavaSymbol(config, guard, workspace,
+    { symbol: 'UserService.updateUser', path: 'java/example/UserService.java' });
+  assert.equal(javaSymbols.total, 2, 'Java method overloads must be distinguishable');
+  assert.deepEqual(javaSymbols.definitions.map((d) => d.parameter_types),
+    [['String'], ['String', 'int']]);
+  assert(javaSymbols.definitions.every(d => d.kind === 'method' && d.line > 0 && d.column > 0));
+  const overloaded = await javaApi.findJavaReferences(config, guard, workspace,
+    { symbol: 'UserService.updateUser', path: 'java/example/UserService.java' });
+  assert.equal(overloaded.ambiguous, true, 'unqualified overloaded Java reference must be refused');
+  assert.equal(overloaded.references.length, 0);
+  const selectedJava = await javaApi.findJavaReferences(config, guard, workspace, {
+    symbol: 'UserService.updateUser', path: 'java/example/UserService.java',
+    parameterTypes: ['String', 'int'], includeTests: true
+  });
+  assert.equal(selectedJava.ambiguous, false);
+  assert(selectedJava.references.some(r => r.path === 'java/example/Caller.java' && r.line === 5));
+  assert(selectedJava.references.some(r => r.path === 'java/example/UserService.java' && r.line === 6));
+  assert(selectedJava.references.some(r => r.path === 'test/java/UserServiceTest.java'));
+  assert(!selectedJava.references.some(r => r.path === 'java/example/OtherService.java'));
+  assert(!selectedJava.references.some(r => r.path === 'java/example/Caller.java' && (r.line === 8 || r.line === 10 || r.line === 11 || r.line === 13)));
+  const noJavaTests = await javaApi.findJavaReferences(config, guard, workspace, {
+    symbol: 'UserService.updateUser', path: 'java/example/UserService.java',
+    parameterTypes: ['String', 'int'], includeTests: false
+  });
+  assert(!noJavaTests.references.some(r => r.role === 'test'));
+  const audited = await javaApi.findJavaReferences(config, guard, workspace, {
+    symbol: 'UserService.audit', path: 'java/example/UserService.java'
+  });
+  assert(audited.references.some(r => r.path === 'java/example/Caller.java' && r.line === 9));
+  const otherJava = await javaApi.findJavaReferences(config, guard, workspace, {
+    symbol: 'OtherService.updateUser', path: 'java/example/OtherService.java'
+  });
+  assert(otherJava.references.some(r => r.path === 'java/example/Caller.java' && r.line === 8));
+  assert(!otherJava.references.some(r => r.path === 'java/example/Caller.java' && r.line === 5));
+  const limitedJava = await javaApi.findJavaReferences(config, guard, workspace, {
+    symbol: 'UserService.updateUser', path: 'java/example/UserService.java',
+    parameterTypes: ['String', 'int'], maxResults: 1
+  });
+  assert.equal(limitedJava.references.length, 1);
+  assert(limitedJava.truncated);
+  assert(javaSymbols.warnings.some(w => /heuristic|not compiler/i.test(w)),
+    'Java results must disclose heuristic resolution limitations');
+  await fs.appendFile(path.join(tmp, 'java', 'example', 'UserService.java'),
+    'class AddedService { void addedMethod() {} }\n', 'utf8');
+  analysisApi.invalidateWorkspaceAnalysis(workspace.id);
+  const changedJava = await javaApi.findJavaSymbol(config, guard, workspace,
+    { symbol: 'AddedService.addedMethod', path: 'java/example/UserService.java' });
+  assert.equal(changedJava.total, 1, 'Java index must refresh after source invalidation');
+  const javaNotice = await symbolApi.findSymbol(config, guard, workspace, { symbol: 'Service' });
+  assert.equal(javaNotice.total, 0, 'unsupported Java declarations must not be claimed as semantic');
+  const truncatedRefs = await symbolApi.findReferences(config, guard, workspace, {
+    symbol: 'compute', path: 'src/nav-alpha.ts', maxResults: 1
+  });
+  assert.equal(truncatedRefs.references.length, 1);
+  assert.equal(truncatedRefs.truncated, true);
+  await write('src/nav-alpha.ts', 'export function computeNew() { return true; }\n');
+  analysisApi.invalidateWorkspaceAnalysis(workspace.id);
+  const updatedNav = await symbolApi.findSymbol(config, guard, workspace, { symbol: 'computeNew', path: 'src/nav-alpha.ts' });
+  assert.equal(updatedNav.total, 1, 'semantic index must rebuild after workspace invalidation');
+  const staleNav = await symbolApi.findSymbol(config, guard, workspace, { symbol: 'compute', path: 'src/nav-alpha.ts' });
+  assert.equal(staleNav.total, 0);
 
   const cached = await analysisApi.inspectWorkspace(config, guard, workspace);
   assert.equal(cached.cache.hit, true);
