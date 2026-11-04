@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Enhanced multi-workspace support: list configured-but-unopened roots without changing the opened-workspaces API, save/select explicit project aliases, and inspect bounded cross-workspace static Java/JS/TS and npm/Maven dependencies with source-line evidence, coverage warnings, and isolated smoke tests.
+
 - Accelerated inferred Java `find_references` by using bounded ripgrep filename candidates before source parsing, prioritizing the declaration file and preserving receiver/overload filtering, partial-coverage warnings, test exclusions, and the bounded index fallback when ripgrep is missing. Added regression cases for limited inventory, Unicode paths, missing ripgrep, and candidate-budget truncation.
 - Optimized Java heuristic `find_symbol`: explicit Java file paths now use a bounded single-file parse instead of building the workspace index; class, interface, enum, record, and nested-type declarations are also searchable without JDT. Added file-scoped and workspace regression coverage.
 - Fixed Eclipse JDT LS workspace initialization by supplying `initializationOptions.workspaceFolders` in addition to standard LSP `workspaceFolders`, with Maven import enabled and mock-protocol validation; confirmed with a real JDT LS 1.62.0 and JDK 25 on a disposable Maven workspace.

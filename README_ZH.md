@@ -140,7 +140,18 @@ codexpro settings show
 codexpro start
 ```
 
-让 ChatGPT 对已允许项目执行 `open_workspace`。`open_current_workspace` 切回启动仓库。
+让 ChatGPT 对已允许项目执行 `open_workspace`。`open_current_workspace` 切回启动仓库。`list_workspaces` 的 `workspaces` 仍只列出本会话已打开的工作区；新增 `configured_workspaces` 会展示全部允许的根目录（含尚未打开的目录）及 `opened`、`selected`、`alias` 状态。
+
+可以配置项目别名，之后不必重复输入绝对路径（PowerShell 示例）：
+
+```powershell
+codexpro settings set --root "D:\code\api" --alias "web=D:\code\web"
+codexpro start --root "D:\code\api"
+```
+
+在 ChatGPT 中执行 `open_workspace({alias: "web"})` 可切换到对应项目。也支持启动时直接使用 `--alias name=path`，并可重复配置多个别名。别名目录会加入允许访问的根目录列表；未知别名及与 `root/path` 同时提供会报错。
+
+跨项目只读依赖追踪：使用 `list_workspaces` 返回的 ID 调用 `analyze_workspace_dependencies({source_workspace_id: "ws_...", target_workspace_id: "ws_..."})`。它限定扫描文件数量与字节数，返回 npm/Maven 依赖声明、TS/JS 导入、Java import、明确指向目标文件的相对路径导入及文件行号。这只是静态证据，不是完整调用图；未匹配不代表无依赖。
 
 两个 ChatGPT 账号或需要硬隔离时，用不同端口和 Server URL 跑两个 CodexPro 进程。
 

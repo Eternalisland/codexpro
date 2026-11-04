@@ -97,6 +97,30 @@ export class WorkspaceManager {
     return workspace;
   }
 
+  openWorkspaceByAlias(alias: string): Workspace {
+    const root = this.config.workspaceAliases?.[alias.trim().toLowerCase()];
+    if (!root) throw new CodexProError(`Unknown workspace alias: ${alias}`);
+    return this.openWorkspace(root);
+  }
+
+  aliasForRoot(root: string): string | undefined {
+    return Object.entries(this.config.workspaceAliases ?? {}).find(([, target]) => target === root)?.[0];
+  }
+
+  listConfiguredWorkspaces(): Array<Workspace & { alias?: string; opened: boolean; selected: boolean }> {
+    return [...new Set([this.config.defaultRoot, ...this.config.allowedRoots])].map((root) => {
+      const opened = [...this.workspaces.values()].find((workspace) => workspace.root === root);
+      return {
+        id: opened?.id ?? workspaceIdForRoot(root),
+        root,
+        openedAt: opened?.openedAt ?? "",
+        alias: this.aliasForRoot(root),
+        opened: Boolean(opened),
+        selected: Boolean(opened && opened.id === this.selectedWorkspaceId)
+      };
+    });
+  }
+
   openWorkspace(rootInput?: string, options: { select?: boolean } = {}): Workspace {
     const requested = rootInput?.trim() ? expandHome(rootInput.trim()) : this.config.defaultRoot;
     const resolved = path.resolve(requested);

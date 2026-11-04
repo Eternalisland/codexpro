@@ -68,6 +68,7 @@ Options:
   --project <dir>           Additional allowed project. settings set saves it. Can be repeated.
   --clear-projects          Remove saved additional projects with settings set.
   --allow-root <dir>        Additional allowed root for this launch. Can be repeated.
+  --alias <name=dir>        Named project shortcut. Can be repeated; settings set persists it.
   --allow-home              Allow opening any workspace under your home directory.
   --mode <agent|handoff|pro>
                              Default: agent.
@@ -333,7 +334,7 @@ function printSavedProfileHint(profile) {
 }
 
 function parseArgs(argv) {
-  const out = { allowRoots: [] };
+  const out = { allowRoots: [], workspaceAliases: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const raw = argv[i];
     if (!raw.startsWith('--')) continue;
@@ -393,6 +394,7 @@ function parseArgs(argv) {
       if (value === undefined || (inlineValue === undefined && value.startsWith('--'))) throw new Error(`Missing value for --${key}`);
       if (inlineValue === undefined) i += 1;
       if (key === 'allow-root' || key === 'project') out.allowRoots.push(value);
+      else if (key === 'alias') out.workspaceAliases.push(value);
       else out[key.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value;
     }
   }
@@ -527,6 +529,25 @@ function realDir(input) {
   return fs.realpathSync.native(resolved);
 }
 
+function configuredWorkspaceAliases(args = {}, profile = {}) {
+  const aliases = { ...(args.clearProjects ? {} : profile.workspaceAliases ?? {}) };
+  for (const spec of args.workspaceAliases ?? []) {
+    const separator = spec.indexOf('=');
+    const name = spec.slice(0, separator).trim();
+    const dir = spec.slice(separator + 1).trim();
+    if (separator < 1 || !/^[a-z][a-z0-9_-]{0,63}$/i.test(name) || !dir) {
+      throw new Error(`Invalid --alias ${spec}. Expected --alias name=/absolute/project/path.`);
+    }
+    const key = name.toLowerCase();
+    const resolved = realDir(dir);
+    if (aliases[key] && realDir(aliases[key]) !== resolved) {
+      throw new Error(`Conflicting workspace alias: ${name}`);
+    }
+    aliases[key] = resolved;
+  }
+  return aliases;
+}
+
 function configuredProjectRoots(root, args = {}, profile = {}) {
   const saved = args.clearProjects
     ? []
@@ -534,7 +555,7 @@ function configuredProjectRoots(root, args = {}, profile = {}) {
       ? profile.allowedRoots
       : [];
   const requested = Array.isArray(args.allowRoots) ? args.allowRoots : [];
-  return [...new Set([...saved, ...requested].map(realDir))].filter((projectRoot) => projectRoot !== root);
+  return [...new Set([...saved, ...requested, ...Object.values(configuredWorkspaceAliases(args, profile))].map(realDir))].filter((projectRoot) => projectRoot !== root);
 }
 
 function resolveCodexDir(root, input) {
@@ -851,6 +872,7 @@ function reusableProfilePayload(profile, overrides = {}) {
     updatedAt,
     profilePath,
     allowedRoots,
+    workspaceAliases,
     ...rest
   } = profile || {};
   return {
@@ -3385,6 +3407,7 @@ function profileFromPreference(root, args, profile, preference) {
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
     ...(allowedRoots.length ? { allowedRoots } : {}),
+    ...(Object.keys(configuredWorkspaceAliases(args, profile)).length ? { workspaceAliases: configuredWorkspaceAliases(args, profile) } : {}),
     ...(args.noInstallCloudflared ? { noInstallCloudflared: true } : {}),
     root
   };
@@ -3592,6 +3615,7 @@ async function runSetupWizard(argv) {
     const shouldSave = !['n', 'no'].includes(saveAnswer.trim().toLowerCase());
     if (shouldSave) {
       const allowedRoots = configuredProjectRoots(root, defaults, profile);
+      const workspaceAliases = configuredWorkspaceAliases(defaults, profile);
       const savedPath = saveWorkspaceProfile(root, {
         port,
         mode,
@@ -3613,6 +3637,7 @@ async function runSetupWizard(argv) {
         ...(widgetDomain ? { widgetDomain } : {}),
         ...toolCardsEntry,
         ...(allowedRoots.length ? { allowedRoots } : {}),
+        ...(Object.keys(workspaceAliases).length ? { workspaceAliases } : {}),
         ...(defaults.noInstallCloudflared ? { noInstallCloudflared: true } : {})
       });
       statusLine('ok', `Saved workspace profile: ${savedPath}`);
@@ -3666,6 +3691,9 @@ function printProfile(root, profile) {
     ...(safe.widgetDomain ? [labelValue('Widget origin', safe.widgetDomain)] : []),
     ...(Array.isArray(safe.allowedRoots) && safe.allowedRoots.length
       ? [labelValue('Projects', safe.allowedRoots.join(', '))]
+      : []),
+    ...(safe.workspaceAliases && Object.keys(safe.workspaceAliases).length
+      ? [labelValue('Aliases', Object.entries(safe.workspaceAliases).map(([name, dir]) => `${name}=${dir}`).join(', '))]
       : []),
     ...(safe.noInstallCloudflared ? [labelValue('cloudflared', 'manual install only')] : []),
     ...(safe.token ? [labelValue('Token', safe.token)] : []),
@@ -3746,6 +3774,7 @@ function saveSettingsFromArgs(root, args, profile) {
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
     ...(allowedRoots.length ? { allowedRoots } : {}),
+    ...(Object.keys(configuredWorkspaceAliases(args, profile)).length ? { workspaceAliases: configuredWorkspaceAliases(args, profile) } : {}),
     ...(args.noInstallCloudflared ?? profile.noInstallCloudflared ? { noInstallCloudflared: true } : {})
   });
   statusLine('ok', `Saved workspace settings: ${savedPath}`);
@@ -4209,6 +4238,7 @@ async function main() {
     ...process.env,
     CODEXPRO_ROOT: root,
     CODEXPRO_ALLOWED_ROOTS: allowRoots.join(path.delimiter),
+    CODEXPRO_WORKSPACE_ALIASES: [process.env.CODEXPRO_WORKSPACE_ALIASES, ...Object.entries(configuredWorkspaceAliases(args, profile)).map(([name, dir]) => `${name}=${dir}`)].filter(Boolean).join(path.delimiter),
     CODEXPRO_HOST: host,
     CODEXPRO_PORT: port,
     CODEXPRO_BASH_MODE: bash,

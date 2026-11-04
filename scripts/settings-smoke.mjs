@@ -294,6 +294,8 @@ const saved = run([
   'https://widgets.codexpro.test',
   '--tool-cards',
   'on',
+  '--alias',
+  `beta=${reuseRoot}`,
   '--project',
   reuseRoot,
   '--token',
@@ -304,7 +306,7 @@ if (!saved.includes('Saved workspace settings')) {
 }
 
 const shown = run(['settings', 'show', '--root', root], env);
-for (const expected of ['Tunnel', 'ngrok', 'codexpro-test.ngrok-free.app', '19087', 'Tool cards', 'on', 'Bash transcript', 'full', 'Projects', realReuseRoot, '<saved>']) {
+for (const expected of ['Tunnel', 'ngrok', 'codexpro-test.ngrok-free.app', '19087', 'Tool cards', 'on', 'Bash transcript', 'full', 'Projects', realReuseRoot, 'Aliases', 'beta=', '<saved>']) {
   if (!shown.includes(expected)) {
     throw new Error(`settings show missing ${expected}\n${shown}`);
   }
@@ -319,6 +321,7 @@ if (
   || profile.bashTranscript !== 'full'
   || profile.widgetDomain !== 'https://widgets.codexpro.test'
   || JSON.stringify(profile.allowedRoots) !== JSON.stringify([realReuseRoot])
+  || profile.workspaceAliases?.beta !== realReuseRoot
 ) {
   throw new Error(`settings profile did not persist tool/widget options: ${JSON.stringify(profile)}`);
 }
@@ -330,7 +333,7 @@ run([
   '--clear-projects'
 ], env);
 const clearedProjectsProfile = await readProfile(root, home);
-if (clearedProjectsProfile.allowedRoots !== undefined) {
+if (clearedProjectsProfile.allowedRoots !== undefined || clearedProjectsProfile.workspaceAliases !== undefined) {
   throw new Error(`settings profile did not clear saved projects: ${JSON.stringify(clearedProjectsProfile)}`);
 }
 

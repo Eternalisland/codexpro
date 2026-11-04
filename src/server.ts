@@ -15,6 +15,7 @@ import { runWorkspaceChecks, workspaceFingerprint } from "./checkOps.js";
 import { ManagedCheckManager } from "./checkJobOps.js";
 import { gitDiff, gitDiffStats as readGitDiffStats, gitDiffStatus, gitLog, gitRuntimeStatus, gitStatus } from "./gitOps.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
+import { analyzeCrossWorkspaceDependencies } from "./crossWorkspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession, readCodexSessionAround, searchCodexSession } from "./codexSessions.js";
@@ -381,7 +382,9 @@ const MINIMAL_TOOL_NAMES = [
 ] as const;
 
 const STANDARD_TOOL_NAMES = [
+  "analyze_workspace_dependencies",
   ...MINIMAL_TOOL_NAMES,
+  "list_workspaces",
   "inspect_workspace",
   "find_symbol",
   "find_references",
@@ -398,6 +401,7 @@ const STANDARD_TOOL_NAMES = [
 ] as const;
 
 const FULL_TOOL_NAMES = [
+  "analyze_workspace_dependencies",
   SUPERTOOL_NAME,
   "server_config",
   "codexpro_self_test",
@@ -484,7 +488,7 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   }
   if (config.writeMode === "handoff" && !names.includes("handoff_to_agent")) names.push("handoff_to_agent");
   if (!config.analysisEnabled) {
-    for (const analysisTool of ["inspect_workspace", "find_symbol", "find_references", "find_implementations", "get_type_hierarchy", "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
+    for (const analysisTool of ["inspect_workspace", "analyze_workspace_dependencies", "find_symbol", "find_references", "find_implementations", "get_type_hierarchy", "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
       const analysisIndex = names.indexOf(analysisTool);
       if (analysisIndex !== -1) names.splice(analysisIndex, 1);
     }
@@ -1629,6 +1633,7 @@ export function createCodexProServer(
       const safeConfig = {
         defaultRoot: config.defaultRoot,
         allowedRoots: config.allowedRoots,
+        workspaceAliases: config.workspaceAliases,
         host: config.host,
         port: config.port,
         widgetDomain: config.widgetDomain,
@@ -2132,7 +2137,7 @@ export function createCodexProServer(
     "list_workspaces",
     {
       title: "List Workspaces",
-      description: "List workspaces opened in this MCP session and identify the currently selected workspace.",
+      description: "List opened workspaces and configured allowed roots (including roots not yet opened), with selection and aliases.",
       inputSchema: {},
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
@@ -2144,11 +2149,14 @@ export function createCodexProServer(
     async () => {
       const selectedWorkspaceId = workspaces.currentWorkspaceId();
       const current = workspaces.listWorkspaces();
-      const text = current
-        .map((workspace) => `- ${workspace.id} — ${workspace.root}${workspace.id === selectedWorkspaceId ? " (selected)" : ""} (opened ${workspace.openedAt})`)
+      const configured = workspaces.listConfiguredWorkspaces();
+      const text = configured
+        .map((workspace) => `- ${workspace.alias ? `${workspace.alias} — ` : ""}${workspace.id} — ${workspace.root} (${workspace.selected ? "selected" : workspace.opened ? "opened" : "configured, not opened"})`)
         .join("\n");
       return textResult(text, {
         workspaces: current,
+        configured_workspaces: configured,
+        configured_count: configured.length,
         count: current.length,
         selected_workspace_id: selectedWorkspaceId
       });
@@ -2215,6 +2223,7 @@ export function createCodexProServer(
         "Open and select an allowed local project for this MCP session. Later tool calls may omit workspace_id to use this selection.",
       inputSchema: {
         root: z.string().optional().describe("Project directory to open. Omit to use CODEXPRO_ROOT/current working directory. Supports ~/ paths."),
+        alias: z.string().optional().describe("Configured workspace alias from --alias name=path. Mutually exclusive with root/path."),
         path: z.string().optional().describe("Alias for root. Useful for clients that naturally send path instead of root."),
         include_tree: z.boolean().optional().describe("Include a compact file tree. Default: true."),
         max_depth: z.number().int().min(1).max(8).optional().describe("Tree depth. Default: 3."),
@@ -2234,7 +2243,8 @@ export function createCodexProServer(
       if (args.root && args.path && args.root !== args.path) {
         throw new CodexProError("open_workspace accepts either root or path. If both are provided, they must match.");
       }
-      const workspace = workspaces.openWorkspace(args.root ?? args.path);
+      if (args.alias && (args.root || args.path)) throw new CodexProError("open_workspace alias cannot be combined with root/path.");
+      const workspace = args.alias ? workspaces.openWorkspaceByAlias(args.alias) : workspaces.openWorkspace(args.root ?? args.path);
       const summary = await workspaceSummary(config, guard, workspace, {
         includeTree: args.include_tree !== false,
         maxDepth: limitInt(args.max_depth, 3, 1, 8),
@@ -3896,6 +3906,40 @@ ${result.prompt}
         deletions: result.writeResult.diff.deletions,
         diff: result.writeResult.diff.diff
       });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "analyze_workspace_dependencies",
+    {
+      title: "Analyze Cross-Workspace Dependencies",
+      description: "Read-only bounded static scan of imports and npm/Maven dependencies from a source workspace into a target workspace. Returns file/line evidence and coverage limits; not a runtime call graph.",
+      inputSchema: {
+        source_workspace_id: z.string().optional().describe("Source workspace ID. Defaults to the selected workspace."),
+        target_workspace_id: z.string().min(1).describe("Target ID from list_workspaces configured_workspaces or open_workspace."),
+        max_files: z.number().int().min(10).max(2000).optional().describe("Maximum files inventoried per workspace. Default: 1000."),
+        max_matches: z.number().int().min(1).max(300).optional().describe("Maximum evidence matches returned. Default: 100.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const source = workspaces.getWorkspace(args.source_workspace_id);
+      const target = workspaces.getWorkspace(args.target_workspace_id);
+      const result = await analyzeCrossWorkspaceDependencies(config, guard, source, target, {
+        maxFiles: args.max_files,
+        maxMatches: args.max_matches
+      });
+      const text = [
+        "# Cross-workspace static dependencies",
+        `From: ${source.id}`,
+        `To: ${target.id}`,
+        `Matches: ${result.matches.length}`,
+        ...result.matches.map((match) => `- ${match.file}:${match.line} [${match.kind}, ${match.confidence}] ${match.reference} -> ${match.target}`),
+        ...result.warnings.map((warning) => `Warning: ${warning}`)
+      ].join("\n");
+      return textResult(text, result);
     }
   );
 

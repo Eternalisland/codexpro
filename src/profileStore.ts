@@ -35,6 +35,7 @@ export interface WorkspaceProfile {
   widgetDomain?: string;
   noInstallCloudflared?: boolean;
   allowedRoots?: string[];
+  workspaceAliases?: Record<string, string>;
 }
 
 export interface RuntimeConnection {

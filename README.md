@@ -103,7 +103,11 @@ codexpro settings show
 codexpro start
 ```
 
-Ask ChatGPT to `open_workspace` on an allowed project. `open_current_workspace` returns to the launch repo.
+Ask ChatGPT to `open_workspace` on an allowed project. `open_current_workspace` returns to the launch repo. `list_workspaces` keeps its existing opened-only `workspaces` field and adds `configured_workspaces` (including unopened roots, aliases, and selection state).
+
+Use `codexpro settings set --root /code/api --alias web=/code/web` to save a named project, then `open_workspace({alias: "web"})` to select it. The repeatable `--alias name=path` flag also works for a single launch and includes those roots in the allowlist.
+
+For bounded, read-only static cross-project checks, use `analyze_workspace_dependencies({source_workspace_id: "ws_...", target_workspace_id: "ws_..."})` with IDs from `list_workspaces`. It returns evidence from npm/Maven manifests and Java/TS/JS imports with file and line locations; this is **not** a complete runtime call graph.
 
 For two ChatGPT accounts or hard isolation, run two CodexPro processes on different ports and Server URLs.
 

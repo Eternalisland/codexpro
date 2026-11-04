@@ -16,6 +16,7 @@ export const MAX_BASH_TIMEOUT_MS = 900_000;
 export interface CodexProConfig {
   defaultRoot: string;
   allowedRoots: string[];
+  workspaceAliases: Record<string, string>;
   host: string;
   port: number;
   widgetDomain: string;
@@ -117,7 +118,7 @@ function parseArgs(argv: string[]): Record<string, string | string[] | boolean> 
       }
     }
 
-    if (key === "allow-root") {
+    if (key === "allow-root" || key === "alias") {
       const prev = out[key];
       if (Array.isArray(prev)) prev.push(String(value));
       else if (prev) out[key] = [String(prev), String(value)];
@@ -268,6 +269,25 @@ function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
 
+function parseWorkspaceAliases(values: string[]): Record<string, string> {
+  const aliases: Record<string, string> = Object.create(null);
+  for (const value of values) {
+    const separator = value.indexOf("=");
+    const name = value.slice(0, separator).trim();
+    const root = value.slice(separator + 1).trim();
+    if (separator < 1 || !/^[a-z][a-z0-9_-]{0,63}$/i.test(name) || !root) {
+      throw new Error(`Invalid workspace alias: ${value}. Expected --alias name=/absolute/project/path.`);
+    }
+    const key = name.toLowerCase();
+    const resolved = toRealDir(root);
+    if (aliases[key] && aliases[key] !== resolved) {
+      throw new Error(`Conflicting workspace alias: ${name}`);
+    }
+    aliases[key] = resolved;
+  }
+  return aliases;
+}
+
 export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
   const args = parseArgs(argv);
 
@@ -285,8 +305,13 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     ...splitRoots(process.env.CODEBASE_BRIDGE_ALLOWED_ROOTS)
   ];
 
+  const aliasArgs = Array.isArray(args.alias) ? args.alias : typeof args.alias === "string" ? [args.alias] : [];
+  const workspaceAliases = parseWorkspaceAliases([
+    ...splitRoots(process.env.CODEXPRO_WORKSPACE_ALIASES),
+    ...aliasArgs
+  ]);
   const allowHome = process.env.CODEXPRO_ALLOW_HOME === "1" || args["allow-home"] === true;
-  const requestedAllowed = [defaultRoot, ...allowRootArgs, ...envAllowedRoots, ...(allowHome ? [os.homedir()] : [])];
+  const requestedAllowed = [defaultRoot, ...allowRootArgs, ...envAllowedRoots, ...Object.values(workspaceAliases), ...(allowHome ? [os.homedir()] : [])];
   const allowedRoots = [...new Set(requestedAllowed.map(toRealDir))];
 
   const portArg = typeof args.port === "string" ? args.port : undefined;
@@ -343,6 +368,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
   return {
     defaultRoot,
     allowedRoots,
+    workspaceAliases,
     host,
     port: numberFrom(portArg ?? process.env.CODEXPRO_PORT ?? process.env.PORT, 8787, 1, 65535),
     widgetDomain: widgetDomainFrom(widgetDomainArg ?? process.env.CODEXPRO_WIDGET_DOMAIN),

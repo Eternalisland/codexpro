@@ -231,12 +231,13 @@ if (commitResult.status !== 0) {
   throw new Error(`git commit failed: ${commitResult.stderr || commitResult.stdout}`);
 }
 
-const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--allow-root', alternateWorkspace, '--bash', 'safe', '--tool-mode', 'full'], {
+const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--allow-root', alternateWorkspace, '--bash', 'safe', '--tool-mode', 'full', '--alias', `beta=${alternateWorkspace}`], {
   cwd: path.resolve('.'),
   env: {
     ...process.env,
     CODEXPRO_ROOT: tmp,
     CODEXPRO_ALLOWED_ROOTS: [tmp, alternateWorkspace].join(path.delimiter),
+    CODEXPRO_WORKSPACE_ALIASES: '',
     CODEXPRO_BASH_TRANSCRIPT: 'compact',
     CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test',
     CODEXPRO_TOOL_CARDS: '0',
@@ -499,10 +500,61 @@ if (activeSmokeSkills.length !== 1 || activeSmokeSkills[0].source !== 'workspace
 if (currentWithSkills.structuredContent.skill_inventory?.some?.((skill) => skill.name === 'outside-skill')) {
   throw new Error('open_current_workspace followed a symlinked workspace skill root outside the workspace');
 }
+const beforeAliasOpen = await client.request('tools/call', { name: 'list_workspaces', arguments: {} });
+const unopenedAlias = beforeAliasOpen.structuredContent.configured_workspaces?.find?.((workspace) => workspace.alias === 'beta');
+if (!unopenedAlias || unopenedAlias.opened || beforeAliasOpen.structuredContent.workspaces.length !== 1) {
+  throw new Error(`configured but unopened alias was missing or opened: ${JSON.stringify(beforeAliasOpen.structuredContent)}`);
+}
+await expectToolError('open_workspace', { alias: 'missing', include_tree: false }, /Unknown workspace alias/);
+await expectToolError('open_workspace', { alias: 'beta', root: tmp }, /cannot be combined/);
+
 const alternate = await client.request('tools/call', {
   name: 'open_workspace',
-  arguments: { root: alternateWorkspace, include_tree: false }
+  arguments: { alias: 'BETA', include_tree: false }
 });
+const openedAliases = await client.request('tools/call', { name: 'list_workspaces', arguments: {} });
+if (!openedAliases.structuredContent.configured_workspaces?.some?.((entry) => entry.alias === 'beta' && entry.opened && entry.selected)) {
+  throw new Error('list_workspaces did not mark opened alias and selection');
+}
+
+const sourcePackageBefore = await fs.readFile(path.join(tmp, 'package.json'), 'utf8');
+await fs.writeFile(path.join(tmp, 'package.json'), JSON.stringify({
+  ...JSON.parse(sourcePackageBefore),
+  dependencies: { '@demo/remote': '1.0.0' }
+}, null, 2), 'utf8');
+await fs.writeFile(path.join(tmp, 'src', 'workspace-import.ts'), "import { remote } from '@demo/remote';\n", 'utf8');
+await fs.writeFile(path.join(tmp, 'pom.xml'), '<project><groupId>org.demo</groupId><artifactId>consumer</artifactId><dependencies><dependency><groupId>org.demo</groupId><artifactId>remote</artifactId></dependency></dependencies></project>', 'utf8');
+await fs.writeFile(path.join(tmp, 'java', 'example', 'UseRemote.java'), 'package example;\nimport demo.Remote;\nclass UseRemote {}\n', 'utf8');
+await fs.writeFile(path.join(alternateWorkspace, 'package.json'), '{"name":"@demo/remote"}', 'utf8');
+await fs.writeFile(path.join(alternateWorkspace, 'pom.xml'), '<project><groupId>org.demo</groupId><artifactId>remote</artifactId></project>', 'utf8');
+await fs.mkdir(path.join(alternateWorkspace, 'java', 'demo'), { recursive: true });
+await fs.writeFile(path.join(alternateWorkspace, 'java', 'demo', 'Remote.java'), 'package demo;\npublic class Remote {}\n', 'utf8');
+try {
+  const analysis = await client.request('tools/call', {
+    name: 'analyze_workspace_dependencies',
+    arguments: { source_workspace_id: current.structuredContent.workspace_id, target_workspace_id: alternate.structuredContent.workspace_id }
+  });
+  const kinds = new Set(analysis.structuredContent.matches?.map?.((match) => match.kind) ?? []);
+  for (const kind of ['npm_dependency', 'npm_import', 'maven_dependency', 'java_import']) {
+    if (!kinds.has(kind)) throw new Error(`cross-workspace scan missed ${kind}: ${JSON.stringify(analysis.structuredContent)}`);
+  }
+  if (analysis.structuredContent.matches.some((match) => !match.file || !match.line)) {
+    throw new Error('cross-workspace evidence lost file or line');
+  }
+  await expectToolError('analyze_workspace_dependencies', {
+    source_workspace_id: current.structuredContent.workspace_id,
+    target_workspace_id: current.structuredContent.workspace_id
+  }, /must differ/);
+  const limited = await client.request('tools/call', {
+    name: 'analyze_workspace_dependencies',
+    arguments: { source_workspace_id: current.structuredContent.workspace_id, target_workspace_id: alternate.structuredContent.workspace_id, max_files: 10, max_matches: 1 }
+  });
+  if (!limited.structuredContent.coverage?.truncated) throw new Error('bounded cross-workspace scan did not report truncated coverage');
+} finally {
+  await fs.writeFile(path.join(tmp, 'package.json'), sourcePackageBefore, 'utf8');
+  for (const rel of ['src/workspace-import.ts', 'pom.xml', 'java/example/UseRemote.java']) await fs.rm(path.join(tmp, rel), { force: true });
+}
+
 const selectedRead = await client.request('tools/call', {
   name: 'read',
   arguments: { path: 'selected.txt' }
