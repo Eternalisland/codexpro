@@ -157,6 +157,18 @@ codexpro start --root "D:\code\api"
 
 **Vue / Python 静态索引（首阶段）**：`inspect_workspace` 和结构化搜索可提取 `.vue` 的 `<script>` / `<script setup>` 声明及相对导入，保留原始 SFC 行号；尚不分析模板引用或完整 Vue 类型语义。可选设置 `CODEXPRO_PYTHON_AST=1` 使用本机 Python 3 标准库 AST 静态解析 Python 类、同步/异步函数及能明确定位的本地导入；不执行项目源码。Windows 默认运行 `python`，其他平台默认 `python3`，可通过 `CODEXPRO_PYTHON_EXECUTABLE` 指定。该功能受文件、字节和时间预算限制；未启用或解释器不可用时继续使用原有词法索引，不代表具备完整跨语言调用图。
 
+**跨工作区 API 契约候选分析**：新增只读工具 `analyze_api_contracts`。例如先配置 `web`、`api`、`model` 三个工作区别名，再调用：
+```json
+{
+  "frontend_workspace_id": "web",
+  "backend_workspace_id": "api",
+  "python_workspace_id": "model",
+  "max_files": 800,
+  "max_matches": 100
+}
+```
+目前仅识别 Vue/JS/TS 中静态路径的 `fetch`、`EventSource` 和常见 Axios 风格调用，Spring `@*Mapping` 路由、紧邻的 Java `.post().uri("/path")` WebClient 风格调用，以及单行 FastAPI 路由装饰器。支持 Spring 类级 `@RequestMapping` 和 Python `APIRouter(prefix=...)` 的基础前缀。输出 Vue/JS → Java、Java → Python 两段**候选关联**，包含工作区、文件、行号、方法、路径、SSE 线索和覆盖率警告。即使方法与路径一致，也无法证明实际服务地址、运行时调用、数据结构或认证兼容；动态 URL、复杂注解、路由注册、请求路径重写和模型内部调用不在首版覆盖范围。结果不自动合并成已验证的端到端调用链。
+
 两个 ChatGPT 账号或需要硬隔离时，用不同端口和 Server URL 跑两个 CodexPro 进程。
 
 ## 命令

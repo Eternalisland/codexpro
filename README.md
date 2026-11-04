@@ -113,6 +113,8 @@ For bounded, read-only static cross-project checks, use `analyze_workspace_depen
 
 Vue SFC indexing now recognizes TypeScript/JavaScript declarations in `<script>` and `<script setup>` and relative imports with original `.vue` line numbers. Template references and full Vue type resolution are not yet covered. Optional `CODEXPRO_PYTHON_AST=1` enables bounded Python 3 standard-library AST parsing of classes, synchronous/async functions and resolvable local imports without executing repository modules. Set `CODEXPRO_PYTHON_EXECUTABLE` to select a Python 3 binary; without the flag or an available interpreter, indexing falls back to the existing lexical analysis.
 
+For read-only API evidence across Vue/JS, Java and Python workspaces, use `analyze_api_contracts({frontend_workspace_id:"web", backend_workspace_id:"api", python_workspace_id:"model"})` after configuring these workspace aliases. The tool performs bounded static analysis of literal `fetch`, `EventSource`, Axios-like requests, Spring MVC mappings, adjacent Java WebClient `.post().uri(...)` calls, and single-line FastAPI route decorators. It reports two independent sets of candidate links (frontend → backend, backend → Python), line evidence, HTTP methods, SSE hints and coverage warnings. Matching static paths **does not prove runtime connectivity, correct base URLs, authentication or payload compatibility**, and it does not compose a verified end-to-end execution graph. Dynamic paths and complex routing are intentionally omitted.
+
 For two ChatGPT accounts or hard isolation, run two CodexPro processes on different ports and Server URLs.
 
 ## Commands

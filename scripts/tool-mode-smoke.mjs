@@ -44,6 +44,7 @@ async function verify(toolMode, sessions, overrides = {}) {
     }
     assert.equal(names.includes('list_workspaces'), toolMode !== 'minimal', `${label}: workspace list registration`);
     assert.equal(names.includes('analyze_workspace_dependencies'), config.analysisEnabled && toolMode !== 'minimal', `${label}: cross-workspace analysis registration`);
+    assert.equal(names.includes('analyze_api_contracts'), config.analysisEnabled && toolMode !== 'minimal', `${label}: API contract tool registration`);
     if (toolMode === 'full') assert(names.includes('git_status'), `${label}: full tool surface`);
 
     if (!config.connectionTest) {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added bounded, read-only `analyze_api_contracts` for static Vue/TS/JS fetch/EventSource/Axios-style requests, Spring controller routes, Java WebClient-style literal URLs and FastAPI decorator routes. Returns independent frontend-to-Java and Java-to-Python candidate links with workspace IDs, file/line evidence, SSE hints, match limits and partial-coverage warnings. Includes 3-workspace regression tests and tool-mode gates; no runtime call-graph claims.
+
 - Fixed cross-session workspace listing: share opened-workspace visibility through the server registry while preserving session-local selection and the legacy session-only `workspaces` array. Added `server_opened_workspaces`, explicit alias addressing in `workspace_id`, and a pre-fix failing / post-fix passing multi-session test.
 - Added bounded Vue SFC script declarations and relative import indexing with original `.vue` line numbers, plus opt-in Python 3 AST parsing for functions/classes and local imports without executing project code; unsupported cases fall back conservatively and have focused smoke coverage.
 

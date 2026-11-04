@@ -16,6 +16,7 @@ import { ManagedCheckManager } from "./checkJobOps.js";
 import { gitDiff, gitDiffStats as readGitDiffStats, gitDiffStatus, gitLog, gitRuntimeStatus, gitStatus } from "./gitOps.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { analyzeCrossWorkspaceDependencies } from "./crossWorkspaceOps.js";
+import { analyzeApiContracts } from "./apiContractOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession, readCodexSessionAround, searchCodexSession } from "./codexSessions.js";
@@ -382,6 +383,7 @@ const MINIMAL_TOOL_NAMES = [
 ] as const;
 
 const STANDARD_TOOL_NAMES = [
+  "analyze_api_contracts",
   "analyze_workspace_dependencies",
   ...MINIMAL_TOOL_NAMES,
   "list_workspaces",
@@ -401,6 +403,7 @@ const STANDARD_TOOL_NAMES = [
 ] as const;
 
 const FULL_TOOL_NAMES = [
+  "analyze_api_contracts",
   "analyze_workspace_dependencies",
   SUPERTOOL_NAME,
   "server_config",
@@ -488,7 +491,7 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   }
   if (config.writeMode === "handoff" && !names.includes("handoff_to_agent")) names.push("handoff_to_agent");
   if (!config.analysisEnabled) {
-    for (const analysisTool of ["inspect_workspace", "analyze_workspace_dependencies", "find_symbol", "find_references", "find_implementations", "get_type_hierarchy", "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
+    for (const analysisTool of ["inspect_workspace", "analyze_workspace_dependencies", "analyze_api_contracts", "find_symbol", "find_references", "find_implementations", "get_type_hierarchy", "run_checks", "start_check", "get_check", "list_checks", "resume_check", "wait_check", "stop_check"]) {
       const analysisIndex = names.indexOf(analysisTool);
       if (analysisIndex !== -1) names.splice(analysisIndex, 1);
     }
@@ -3945,6 +3948,45 @@ ${result.prompt}
         ...result.warnings.map((warning) => `Warning: ${warning}`)
       ].join("\n");
       return textResult(text, result);
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "analyze_api_contracts",
+    {
+      title: "Analyze Cross-Workspace API Contracts",
+      description: "Read-only, bounded discovery of static Vue/JS HTTP callers, Spring MVC endpoints, Java WebClient callers and FastAPI routes. Matches are inferred candidates, not verified runtime calls.",
+      inputSchema: {
+        frontend_workspace_id: z.string().min(1).describe("Frontend workspace ID or configured alias."),
+        backend_workspace_id: z.string().min(1).describe("Java backend workspace ID or configured alias."),
+        python_workspace_id: z.string().min(1).optional().describe("Optional Python FastAPI workspace ID or configured alias."),
+        max_files: z.number().int().min(10).max(2000).optional().describe("File inventory limit for each workspace. Default: 800."),
+        max_matches: z.number().int().min(1).max(300).optional().describe("Maximum candidate links per adjacent workspace pair. Default: 100.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const frontend = workspaces.getWorkspace(args.frontend_workspace_id);
+      const backend = workspaces.getWorkspace(args.backend_workspace_id);
+      const python = args.python_workspace_id ? workspaces.getWorkspace(args.python_workspace_id) : undefined;
+      const result = await analyzeApiContracts(config, guard, frontend, backend, python, {
+        maxFiles: args.max_files, maxMatches: args.max_matches
+      });
+      const lines = [
+        "# Cross-workspace API contract candidates",
+        "Vue/JS -> Java: " + result.frontend_to_backend.length,
+        "Java -> Python: " + result.backend_to_python.length,
+        ...result.frontend_to_backend.map((edge) =>
+          "- frontend " + edge.caller.file + ":" + edge.caller.line + " -> backend " +
+          edge.endpoint.file + ":" + edge.endpoint.line + " [" + edge.caller.method + " " + edge.caller.path + "] inferred"),
+        ...result.backend_to_python.map((edge) =>
+          "- backend " + edge.caller.file + ":" + edge.caller.line + " -> python " +
+          edge.endpoint.file + ":" + edge.endpoint.line + " [" + edge.caller.method + " " + edge.caller.path + "] inferred"),
+        ...result.warnings.map((warning) => "Warning: " + warning)
+      ];
+      return textResult(lines.join("\n"), result);
     }
   );
 
