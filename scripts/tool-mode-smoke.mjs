@@ -43,6 +43,8 @@ async function verify(toolMode, sessions, overrides = {}) {
       assert.equal(names.includes(name), config.analysisEnabled && toolMode !== 'minimal', `${label}: ${name} registration`);
     }
     assert.equal(names.includes('list_workspaces'), toolMode !== 'minimal', `${label}: workspace list registration`);
+    assert(names.includes('get_task_checkpoint') && names.includes('list_task_checkpoints'), `${label}: checkpoint read tools`);
+    assert.equal(names.includes('save_task_checkpoint'), config.writeMode !== 'off' && !config.connectionTest, `${label}: checkpoint write permission`);
     assert.equal(names.includes('analyze_workspace_dependencies'), config.analysisEnabled && toolMode !== 'minimal', `${label}: cross-workspace analysis registration`);
     assert.equal(names.includes('analyze_api_contracts'), config.analysisEnabled && toolMode !== 'minimal', `${label}: API contract tool registration`);
     if (toolMode === 'full') assert(names.includes('git_status'), `${label}: full tool surface`);

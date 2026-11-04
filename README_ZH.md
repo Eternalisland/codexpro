@@ -169,6 +169,8 @@ codexpro start --root "D:\code\api"
 ```
 目前仅识别 Vue/JS/TS 中静态路径的 `fetch`、`EventSource` 和常见 Axios 风格调用，Spring `@*Mapping` 路由、紧邻的 Java `.post().uri("/path")` WebClient 风格调用，以及单行 FastAPI 路由装饰器。支持 Spring 类级 `@RequestMapping` 和 Python `APIRouter(prefix=...)` 的基础前缀。输出 Vue/JS → Java、Java → Python 两段**候选关联**，包含工作区、文件、行号、方法、路径、SSE 线索和覆盖率警告。即使方法与路径一致，也无法证明实际服务地址、运行时调用、数据结构或认证兼容；动态 URL、复杂注解、路由注册、请求路径重写和模型内部调用不在首版覆盖范围。结果不自动合并成已验证的端到端调用链。
 
+任务中断恢复：长任务可显式调用 `save_task_checkpoint` 保存步骤和下一步；重连后调用 `recover_work`、`get_task_checkpoint` 或 `list_task_checkpoints`。检查点保存在 `CODEXPRO_HOME/runtime/task-checkpoints/`，不写业务仓库。使用 `expected_revision: 0` 创建，以后提交最新返回的修订号，拒绝旧版本覆盖；关联工作区指纹变化时，先检查代码差异再继续。步骤状态属于人工/Agent 记录，不代表测试已验证；恢复不会自动重放代码修改。关闭写入或连接测试模式下不能保存，但仍可读取检查点。
+
 两个 ChatGPT 账号或需要硬隔离时，用不同端口和 Server URL 跑两个 CodexPro 进程。
 
 ## 命令

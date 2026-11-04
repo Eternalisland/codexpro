@@ -115,6 +115,8 @@ Vue SFC indexing now recognizes TypeScript/JavaScript declarations in `<script>`
 
 For read-only API evidence across Vue/JS, Java and Python workspaces, use `analyze_api_contracts({frontend_workspace_id:"web", backend_workspace_id:"api", python_workspace_id:"model"})` after configuring these workspace aliases. The tool performs bounded static analysis of literal `fetch`, `EventSource`, Axios-like requests, Spring MVC mappings, adjacent Java WebClient `.post().uri(...)` calls, and single-line FastAPI route decorators. It reports two independent sets of candidate links (frontend → backend, backend → Python), line evidence, HTTP methods, SSE hints and coverage warnings. Matching static paths **does not prove runtime connectivity, correct base URLs, authentication or payload compatibility**, and it does not compose a verified end-to-end execution graph. Dynamic paths and complex routing are intentionally omitted.
 
+For long-running tasks, `save_task_checkpoint` records explicit step progress and linked workspace fingerprints under `CODEXPRO_HOME/runtime/task-checkpoints/`, outside source repos. On reconnect use `recover_work` then `get_task_checkpoint` to review the next step and detect changes; `list_task_checkpoints` lists saved tasks. New tasks use `expected_revision: 0`; subsequent saves must provide the latest revision. Completed steps are user/agent-reported rather than verified. Recovery never automatically replays edits, and saving is disabled when write mode is off.
+
 For two ChatGPT accounts or hard isolation, run two CodexPro processes on different ports and Server URLs.
 
 ## Commands

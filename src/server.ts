@@ -17,6 +17,7 @@ import { gitDiff, gitDiffStats as readGitDiffStats, gitDiffStatus, gitLog, gitRu
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { analyzeCrossWorkspaceDependencies } from "./crossWorkspaceOps.js";
 import { analyzeApiContracts } from "./apiContractOps.js";
+import { saveTaskCheckpoint, getTaskCheckpoint, listTaskCheckpoints, buildTaskRecoveryPlan } from "./taskCheckpointOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession, readCodexSessionAround, searchCodexSession } from "./codexSessions.js";
@@ -376,6 +377,9 @@ const MINIMAL_TOOL_NAMES = [
   "get_check",
   "list_checks",
   "recover_work",
+  "save_task_checkpoint",
+  "get_task_checkpoint",
+  "list_task_checkpoints",
   "resume_check",
   "wait_check",
   "stop_check",
@@ -435,6 +439,9 @@ const FULL_TOOL_NAMES = [
   "get_check",
   "list_checks",
   "recover_work",
+  "save_task_checkpoint",
+  "get_task_checkpoint",
+  "list_task_checkpoints",
   "resume_check",
   "wait_check",
   "stop_check",
@@ -452,6 +459,7 @@ const FULL_TOOL_NAMES = [
 const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   SUPERTOOL_NAME,
   "codexpro_self_test",
+  "save_task_checkpoint",
   "write",
   "edit",
   "preview_patch",
@@ -482,6 +490,10 @@ function toolNamesForMode(config: CodexProConfig): string[] {
       const bashIndex = names.indexOf(bashTool);
       if (bashIndex !== -1) names.splice(bashIndex, 1);
     }
+  }
+  if (config.writeMode === "off") {
+    const checkpointIndex = names.indexOf("save_task_checkpoint");
+    if (checkpointIndex !== -1) names.splice(checkpointIndex, 1);
   }
   if (config.writeMode !== "workspace") {
     for (const writeTool of ["write", "edit", "preview_patch", "apply_patch", "import_file"]) {
@@ -563,9 +575,10 @@ function serverInstructions(config: CodexProConfig): string {
     "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
     bashInstruction,
-    "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
+    "6. For lengthy tasks, save_task_checkpoint after meaningful steps. After reconnect, call recover_work then get_task_checkpoint before editing. Never automatically replay edits; step completion is not verified test evidence.",
+    "7. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
     config.codexSessions !== "off"
-      ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
+      ? `8. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
     config.requireBashSession && config.bashSessionId
       ? `8. Bash session guard is enabled. Every bash call must include session_id="${config.bashSessionId}".`
@@ -1281,6 +1294,97 @@ function registerManagedCheckTools(
   );
 }
 
+function registerTaskCheckpointTools(
+  config: CodexProConfig,
+  server: McpServer,
+  workspaces: WorkspaceManager,
+  guard: PathGuard
+): void {
+  const workspaceField = z.string().optional().describe("Workspace ID or configured alias; defaults to this MCP session's selection.");
+  const taskField = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/).describe("Stable task identifier, 1-64 characters.");
+  registerCodexTool(config, server, "save_task_checkpoint", {
+    title: "Save Task Checkpoint",
+    description: "Persist an explicit, revision-checked task plan outside source repositories. Records agent/user-reported steps, source files and linked workspace fingerprints. Never runs code, applies edits or marks checks passed.",
+    inputSchema: {
+      workspace_id: workspaceField,
+      task_id: taskField,
+      expected_revision: z.number().int().min(0).max(256).describe("0 to create; otherwise the revision returned by the latest read. Reject stale concurrent writes."),
+      title: z.string().min(1).max(240),
+      status: z.enum(["in_progress", "blocked", "completed"]),
+      steps: z.array(z.object({
+        id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/),
+        title: z.string().min(1).max(200),
+        status: z.enum(["pending", "in_progress", "blocked", "completed"])
+      })).min(1).max(40),
+      next_step_id: z.string().optional().describe("ID of the next unfinished step."),
+      related_workspace_ids: z.array(z.string().min(1)).max(4).optional().describe("Additional configured workspaces to fingerprint for this task."),
+      changed_files: z.array(z.object({
+        workspace_id: z.string().min(1),
+        path: z.string().min(1).max(1024)
+      })).max(80).optional().describe("Paths with owning workspace IDs or configured aliases, used as review evidence."),
+      check_job_ids: z.array(z.string().regex(/^check_[a-f0-9]{16}$/)).max(20).optional(),
+      note: z.string().max(2000).optional().describe("Optional non-secret progress note; do not store credentials.")
+    },
+    annotations: HANDOFF_WRITE_ANNOTATIONS
+  }, async (args) => {
+    const primary = workspaces.getWorkspace(args.workspace_id);
+    const related = (args.related_workspace_ids ?? []).map((id: string) => workspaces.getWorkspace(id));
+    const files = (args.changed_files ?? []).map((item: { workspace_id: string; path: string }) => ({
+      workspace_id: workspaces.getWorkspace(item.workspace_id).id,
+      path: item.path
+    }));
+    const result = await saveTaskCheckpoint(config, guard, primary, related, {
+      taskId: args.task_id, expectedRevision: args.expected_revision,
+      title: args.title, status: args.status, steps: args.steps,
+      nextStepId: args.next_step_id, changedFiles: files,
+      checkJobIds: args.check_job_ids ?? [], note: args.note
+    });
+    return textResult(
+      "# Task checkpoint saved\n\nTask: " + result.checkpoint.task_id +
+      "\nRevision: " + result.checkpoint.revision + "\nReused: " + result.reused,
+      { workspace_id: primary.id, ...result }
+    );
+  });
+
+  registerCodexTool(config, server, "get_task_checkpoint", {
+    title: "Get Task Checkpoint",
+    description: "Read an immutable latest task revision and a non-executing recovery plan; compare all linked workspace fingerprints before suggesting a next step.",
+    inputSchema: { workspace_id: workspaceField, task_id: taskField },
+    annotations: READ_ONLY_ANNOTATIONS
+  }, async (args) => {
+    const primary = workspaces.getWorkspace(args.workspace_id);
+    const checkpoint = await getTaskCheckpoint(primary, args.task_id);
+    const recovery_plan = await buildTaskRecoveryPlan(config, guard, checkpoint,
+      (_id, root) => workspaces.openWorkspace(root, { select: false }));
+    return textResult(
+      "# Task checkpoint\n\nTask: " + checkpoint.task_id +
+      "\nRevision: " + checkpoint.revision +
+      "\nRequires review: " + recovery_plan.requires_review +
+      "\nNext step: " + (recovery_plan.next_step?.title ?? "(none)"),
+      { workspace_id: primary.id, checkpoint, recovery_plan }
+    );
+  });
+
+  registerCodexTool(config, server, "list_task_checkpoints", {
+    title: "List Task Checkpoints",
+    description: "List bounded persisted task summaries for a workspace across MCP sessions. Does not execute any task.",
+    inputSchema: {
+      workspace_id: workspaceField,
+      limit: z.number().int().min(1).max(40).optional()
+    },
+    annotations: READ_ONLY_ANNOTATIONS
+  }, async (args) => {
+    const primary = workspaces.getWorkspace(args.workspace_id);
+    const result = await listTaskCheckpoints(primary, args.limit ?? 10);
+    return textResult(
+      "# Saved tasks\n\n" + (result.tasks.length
+        ? result.tasks.map((task) => "- " + task.task_id + " r" + task.revision + ": " + task.status).join("\n")
+        : "(no saved tasks)"),
+      { workspace_id: primary.id, ...result }
+    );
+  });
+}
+
 function registerCheckRecoveryTools(
   config: CodexProConfig,
   server: McpServer,
@@ -1383,6 +1487,21 @@ function registerCheckRecoveryTools(
             trimmed !== "(no output)";
         });
       const dirty = statusLines.length > 0 || diffStats.changed;
+      let taskList: Awaited<ReturnType<typeof listTaskCheckpoints>> = { tasks: [], warnings: [] };
+      let taskRecovery: Awaited<ReturnType<typeof buildTaskRecoveryPlan>> | undefined;
+      let latestActiveTask: (typeof taskList.tasks)[number] | undefined;
+      try {
+        taskList = await listTaskCheckpoints(workspace, limit);
+        latestActiveTask = taskList.tasks.find((task) => task.status !== "completed");
+        if (latestActiveTask) {
+          const task = await getTaskCheckpoint(workspace, latestActiveTask.task_id);
+          taskRecovery = await buildTaskRecoveryPlan(config, guard, task,
+            (_id, root) => workspaces.openWorkspace(root, { select: false }));
+        }
+      } catch {
+        taskList.warnings.push("Unable to read or validate a saved task checkpoint.");
+        taskRecovery = undefined;
+      }
 
       const runnerActive = (job: Record<string, unknown>) => {
         const lease = job.runner_lease;
@@ -1423,6 +1542,19 @@ function registerCheckRecoveryTools(
             reason: "The previous check is interrupted but its original runner/process is still active; wait rather than resume."
           };
         }
+      } else if (latestActiveTask && taskRecovery) {
+        suggestedAction = taskRecovery.requires_review
+          ? {
+              action: "show_changes",
+              task_id: latestActiveTask.task_id,
+              workspace_id: taskRecovery.workspace_changes.find((item) => item.changed)?.workspace_id ?? workspace.id,
+              reason: "A saved task has changed or inaccessible workspace state. Review source changes before continuing."
+            }
+          : {
+              action: "get_task_checkpoint",
+              task_id: latestActiveTask.task_id,
+              reason: "An unfinished task exists. Read its validated recovery plan before continuing."
+            };
       } else if (dirty) {
         suggestedAction = {
           action: "show_changes",
@@ -1452,6 +1584,7 @@ function registerCheckRecoveryTools(
         `Fingerprint: ${fingerprint}`,
         `Git dirty: ${dirty}`,
         `Recent checks: ${jobs.length}`,
+        `Saved tasks: ${taskList.tasks.length}`,
         `Suggested action: ${suggestedAction.action}${runtimeText}`
       ].join("\n");
 
@@ -1468,6 +1601,10 @@ function registerCheckRecoveryTools(
           changed_entries: statusLines.slice(0, 200)
         },
         recent_checks: jobs,
+        recent_task_checkpoints: taskList.tasks,
+        task_checkpoint_warnings: taskList.warnings,
+        ...(latestActiveTask ? { latest_task_checkpoint: latestActiveTask } : {}),
+        ...(taskRecovery ? { task_recovery_plan: taskRecovery } : {}),
         ...(latestCheck ? { latest_check: latestCheck } : {}),
         suggested_action: suggestedAction
       });
@@ -1526,6 +1663,7 @@ export function createCodexProServer(
   registerReadManyTool(config, server, workspaces, guard);
   registerManagedCheckTools(config, server, workspaces, guard, managedChecks);
   registerCheckRecoveryTools(config, server, workspaces, guard, managedChecks);
+  registerTaskCheckpointTools(config, server, workspaces, guard);
 
   registerCodexTool(
     config,
