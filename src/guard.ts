@@ -24,6 +24,10 @@ export class WorkspaceRegistry {
     return this.workspaces.get(id);
   }
 
+  list(): Workspace[] {
+    return [...this.workspaces.values()];
+  }
+
   register(workspace: Workspace): Workspace {
     const existing = this.workspaces.get(workspace.id);
     if (existing) return existing;
@@ -109,7 +113,7 @@ export class WorkspaceManager {
 
   listConfiguredWorkspaces(): Array<Workspace & { alias?: string; opened: boolean; selected: boolean }> {
     return [...new Set([this.config.defaultRoot, ...this.config.allowedRoots])].map((root) => {
-      const opened = [...this.workspaces.values()].find((workspace) => workspace.root === root);
+      const opened = this.registry.findByRoot(root);
       return {
         id: opened?.id ?? workspaceIdForRoot(root),
         root,
@@ -164,6 +168,8 @@ export class WorkspaceManager {
     const workspace = this.workspaces.get(id) ?? this.registry.get(id);
     if (workspace) this.workspaces.set(id, workspace);
     if (!workspace) {
+      const aliasRoot = this.config.workspaceAliases?.[id.trim().toLowerCase()];
+      if (aliasRoot) return this.openWorkspace(aliasRoot, { select: false });
       const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
       if (configuredRoot) return this.openWorkspace(configuredRoot, { select: false });
     }
@@ -175,6 +181,10 @@ export class WorkspaceManager {
 
   listWorkspaces(): Workspace[] {
     return [...this.workspaces.values()];
+  }
+
+  listServerWorkspaces(): Workspace[] {
+    return this.registry.list();
   }
 
   currentWorkspaceId(): string {

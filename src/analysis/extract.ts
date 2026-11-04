@@ -3,6 +3,8 @@ import path from "node:path";
 import type { CodexProConfig } from "../config.js";
 import type { PathGuard, Workspace } from "../guard.js";
 import type { AnalysisLanguage, AnalysisSymbol, AnalysisSymbolKind, InventoryFile } from "./types.js";
+import { indexVueScript } from "./vueSfc.js";
+import { indexPythonAst, resolvePythonAstImports } from "./pythonAst.js";
 
 type Pattern = { regex: RegExp; kind: AnalysisSymbolKind };
 
@@ -56,7 +58,7 @@ const DECLARATIONS: Partial<Record<AnalysisLanguage, Pattern[]>> = {
   ]
 };
 
-const SOURCE_LANGUAGES = new Set<AnalysisLanguage>(["typescript", "javascript", "python", "go", "rust", "swift", "java", "csharp", "c", "cpp"]);
+const SOURCE_LANGUAGES = new Set<AnalysisLanguage>(["vue", "typescript", "javascript", "python", "go", "rust", "swift", "java", "csharp", "c", "cpp"]);
 
 export interface ExtractedFile {
   path: string;
@@ -81,7 +83,7 @@ function resolveInternalImport(fromPath: string, specifier: string, files: Set<s
   if (!specifier.startsWith(".")) return undefined;
   const raw = path.posix.normalize(path.posix.join(path.posix.dirname(fromPath), specifier));
   const withoutRuntimeExtension = raw.replace(/\.(js|mjs|cjs)$/, "");
-  const candidates = [raw, withoutRuntimeExtension, ...[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".swift", ".java", ".cs", ".c", ".cpp", ".h", ".hpp"].map((ext) => `${withoutRuntimeExtension}${ext}`), ...["index.ts", "index.tsx", "index.js", "index.py"].map((name) => `${withoutRuntimeExtension}/${name}`)];
+  const candidates = [raw, withoutRuntimeExtension, ...[".vue", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".swift", ".java", ".cs", ".c", ".cpp", ".h", ".hpp"].map((ext) => `${withoutRuntimeExtension}${ext}`), ...["index.ts", "index.tsx", "index.js", "index.py"].map((name) => `${withoutRuntimeExtension}/${name}`)];
   return candidates.find((candidate) => files.has(candidate));
 }
 
@@ -98,6 +100,7 @@ export async function extractWorkspaceFiles(
   let sourceBudgetReached = false;
   let symbolBudgetReached = false;
   let skippedFiles = 0;
+  const parserWarnings: string[] = [];
   for (const file of inventoryFiles) {
     if (!SOURCE_LANGUAGES.has(file.language) || file.generated) continue;
     if (extracted.length >= config.analysisLimits.maxAnalyzedFiles || scannedBytes + file.bytes > config.analysisLimits.maxScannedBytes) {
@@ -120,6 +123,21 @@ export async function extractWorkspaceFiles(
     scannedBytes += actualBytes;
     const symbols: AnalysisSymbol[] = [];
     const imports: string[] = [];
+    if (file.language === "vue") {
+      const vue = indexVueScript(file.path, text);
+      for (const symbol of vue.symbols) {
+        if (symbolCount >= config.analysisLimits.maxSymbols) { symbolBudgetReached = true; break; }
+        symbols.push(symbol);
+        symbolCount += 1;
+      }
+      for (const specifier of vue.imports) {
+        const target = resolveInternalImport(file.path, specifier, fileSet);
+        if (target && !imports.includes(target)) imports.push(target);
+      }
+      for (const warning of vue.warnings) if (parserWarnings.length < 20) parserWarnings.push(`${file.path}: ${warning}`);
+      extracted.push({ path: file.path, text, symbols, imports });
+      continue;
+    }
     const lines = text.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
@@ -140,7 +158,37 @@ export async function extractWorkspaceFiles(
     }
     extracted.push({ path: file.path, text, symbols, imports });
   }
+  const pythonFiles = extracted.filter((file) => file.path.toLowerCase().endsWith(".py"));
+  const pythonAst = await indexPythonAst(pythonFiles);
+  for (const file of pythonFiles) {
+    const parsed = pythonAst.results.get(file.path);
+    if (!parsed || parsed.error) continue;
+    file.symbols = parsed.symbols
+      .filter((symbol) => typeof symbol.name === "string" && Number.isInteger(symbol.line) && symbol.line > 0)
+      .map((symbol) => ({
+        name: symbol.name,
+        kind: symbol.kind,
+        path: file.path,
+        line: symbol.line,
+        exported: !symbol.name.startsWith("_"),
+        confidence: "strong" as const
+      }));
+    file.imports = resolvePythonAstImports(file.path, parsed.imports, fileSet);
+  }
+  if (pythonAst.results.size) {
+    let indexedSymbols = 0;
+    for (const file of extracted) {
+      const remaining = Math.max(0, config.analysisLimits.maxSymbols - indexedSymbols);
+      if (file.symbols.length > remaining) {
+        file.symbols = file.symbols.slice(0, remaining);
+        symbolBudgetReached = true;
+      }
+      indexedSymbols += file.symbols.length;
+    }
+  }
   const warnings = [
+    ...pythonAst.warnings,
+    ...parserWarnings,
     ...(sourceBudgetReached ? ["Source analysis reached its file or byte limit."] : []),
     ...(symbolBudgetReached ? ["Symbol extraction reached its configured limit."] : []),
     ...(skippedFiles ? [`Skipped ${skippedFiles} source file${skippedFiles === 1 ? "" : "s"} that changed or became unreadable during analysis.`] : [])

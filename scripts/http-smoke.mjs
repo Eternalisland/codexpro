@@ -797,6 +797,14 @@ try {
 
     await withClient(mcpUrl, async (secondClient) => {
       const secondList = await callTool(secondClient, 'list_workspaces');
+      if (secondList.structuredContent.configured_workspaces.some((workspace) =>
+        workspace.id === alternate.structuredContent.workspace_id)) {
+        throw new Error("A descendant workspace must not be reported as an explicitly configured root.");
+      }
+      if (!secondList.structuredContent.server_opened_workspaces.some((workspace) =>
+        workspace.id === alternate.structuredContent.workspace_id)) {
+        throw new Error("Server-level opened-workspace list omitted the first HTTP session workspace.");
+      }
       if (
         secondList.structuredContent.selected_workspace_id === alternate.structuredContent.workspace_id
         || secondList.structuredContent.workspaces.some((workspace) => workspace.root === alternateRoot)

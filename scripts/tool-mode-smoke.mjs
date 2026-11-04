@@ -42,6 +42,8 @@ async function verify(toolMode, sessions, overrides = {}) {
     for (const name of semanticTools) {
       assert.equal(names.includes(name), config.analysisEnabled && toolMode !== 'minimal', `${label}: ${name} registration`);
     }
+    assert.equal(names.includes('list_workspaces'), toolMode !== 'minimal', `${label}: workspace list registration`);
+    assert.equal(names.includes('analyze_workspace_dependencies'), config.analysisEnabled && toolMode !== 'minimal', `${label}: cross-workspace analysis registration`);
     if (toolMode === 'full') assert(names.includes('git_status'), `${label}: full tool surface`);
 
     if (!config.connectionTest) {

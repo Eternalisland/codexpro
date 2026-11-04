@@ -555,7 +555,7 @@ function serverInstructions(config: CodexProConfig): string {
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
     "",
     "Preferred workflow:",
-    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; that selection stays active for this MCP session.",
+    "1. Start with open_current_workspace. Switching with open_workspace is local to that MCP session. For cross-session access use a configured alias or stable workspace ID explicitly as workspace_id; never assume another session switched the default.",
     "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
     "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
@@ -2137,7 +2137,7 @@ export function createCodexProServer(
     "list_workspaces",
     {
       title: "List Workspaces",
-      description: "List opened workspaces and configured allowed roots (including roots not yet opened), with selection and aliases.",
+      description: "List server-process opened workspaces and configured allowed roots. Selection is MCP-session-local; use a workspace ID or configured alias across sessions.",
       inputSchema: {},
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
@@ -2149,16 +2149,21 @@ export function createCodexProServer(
     async () => {
       const selectedWorkspaceId = workspaces.currentWorkspaceId();
       const current = workspaces.listWorkspaces();
+      const allOpened = workspaces.listServerWorkspaces();
       const configured = workspaces.listConfiguredWorkspaces();
       const text = configured
         .map((workspace) => `- ${workspace.alias ? `${workspace.alias} — ` : ""}${workspace.id} — ${workspace.root} (${workspace.selected ? "selected" : workspace.opened ? "opened" : "configured, not opened"})`)
         .join("\n");
       return textResult(text, {
         workspaces: current,
+        server_opened_workspaces: allOpened,
+        server_opened_count: allOpened.length,
         configured_workspaces: configured,
         configured_count: configured.length,
         count: current.length,
-        selected_workspace_id: selectedWorkspaceId
+        selected_workspace_id: selectedWorkspaceId,
+        selection_scope: "mcp_session",
+        opened_scope: "server_process"
       });
     }
   );
@@ -2220,7 +2225,7 @@ export function createCodexProServer(
     {
       title: "Open Workspace",
       description:
-        "Open and select an allowed local project for this MCP session. Later tool calls may omit workspace_id to use this selection.",
+        "Open and select an allowed local project for this MCP session. Across different sessions, pass its workspace ID or alias explicitly as workspace_id.",
       inputSchema: {
         root: z.string().optional().describe("Project directory to open. Omit to use CODEXPRO_ROOT/current working directory. Supports ~/ paths."),
         alias: z.string().optional().describe("Configured workspace alias from --alias name=path. Mutually exclusive with root/path."),

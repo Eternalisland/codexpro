@@ -107,7 +107,11 @@ Ask ChatGPT to `open_workspace` on an allowed project. `open_current_workspace` 
 
 Use `codexpro settings set --root /code/api --alias web=/code/web` to save a named project, then `open_workspace({alias: "web"})` to select it. The repeatable `--alias name=path` flag also works for a single launch and includes those roots in the allowlist.
 
+`list_workspaces.workspaces` and `selected_workspace_id` remain MCP-session-local for backwards compatibility; `server_opened_workspaces` and `configured_workspaces[].opened` expose workspace openings shared by sessions in the same CodexPro server process. Always pass a stable workspace ID or a configured alias as `workspace_id: "web"` when switching transports; another session cannot safely change your default selection.
+
 For bounded, read-only static cross-project checks, use `analyze_workspace_dependencies({source_workspace_id: "ws_...", target_workspace_id: "ws_..."})` with IDs from `list_workspaces`. It returns evidence from npm/Maven manifests and Java/TS/JS imports with file and line locations; this is **not** a complete runtime call graph.
+
+Vue SFC indexing now recognizes TypeScript/JavaScript declarations in `<script>` and `<script setup>` and relative imports with original `.vue` line numbers. Template references and full Vue type resolution are not yet covered. Optional `CODEXPRO_PYTHON_AST=1` enables bounded Python 3 standard-library AST parsing of classes, synchronous/async functions and resolvable local imports without executing repository modules. Set `CODEXPRO_PYTHON_EXECUTABLE` to select a Python 3 binary; without the flag or an available interpreter, indexing falls back to the existing lexical analysis.
 
 For two ChatGPT accounts or hard isolation, run two CodexPro processes on different ports and Server URLs.
 

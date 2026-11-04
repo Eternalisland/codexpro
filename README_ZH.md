@@ -151,7 +151,11 @@ codexpro start --root "D:\code\api"
 
 在 ChatGPT 中执行 `open_workspace({alias: "web"})` 可切换到对应项目。也支持启动时直接使用 `--alias name=path`，并可重复配置多个别名。别名目录会加入允许访问的根目录列表；未知别名及与 `root/path` 同时提供会报错。
 
+**多 MCP 会话注意**：`list_workspaces` 的 `workspaces` / `selected_workspace_id` 保持当前会话语义；`server_opened_workspaces` 和 `configured_workspaces[].opened` 显示本 CodexPro 服务进程中其他会话已打开的项目。切换默认项目只对当前会话有效。跨请求或多客户端操作请直接传 `workspace_id: "web"`（也支持稳定的 `ws_...` ID），不要依赖其他会话的选择。
+
 跨项目只读依赖追踪：使用 `list_workspaces` 返回的 ID 调用 `analyze_workspace_dependencies({source_workspace_id: "ws_...", target_workspace_id: "ws_..."})`。它限定扫描文件数量与字节数，返回 npm/Maven 依赖声明、TS/JS 导入、Java import、明确指向目标文件的相对路径导入及文件行号。这只是静态证据，不是完整调用图；未匹配不代表无依赖。
+
+**Vue / Python 静态索引（首阶段）**：`inspect_workspace` 和结构化搜索可提取 `.vue` 的 `<script>` / `<script setup>` 声明及相对导入，保留原始 SFC 行号；尚不分析模板引用或完整 Vue 类型语义。可选设置 `CODEXPRO_PYTHON_AST=1` 使用本机 Python 3 标准库 AST 静态解析 Python 类、同步/异步函数及能明确定位的本地导入；不执行项目源码。Windows 默认运行 `python`，其他平台默认 `python3`，可通过 `CODEXPRO_PYTHON_EXECUTABLE` 指定。该功能受文件、字节和时间预算限制；未启用或解释器不可用时继续使用原有词法索引，不代表具备完整跨语言调用图。
 
 两个 ChatGPT 账号或需要硬隔离时，用不同端口和 Server URL 跑两个 CodexPro 进程。
 

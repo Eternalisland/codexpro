@@ -1,5 +1,6 @@
 export type AnalysisConfidence = "exact" | "strong" | "inferred";
 export type AnalysisLanguage =
+  | "vue"
   | "typescript"
   | "javascript"
   | "python"

@@ -2,6 +2,7 @@ import path from "node:path";
 import type { AnalysisFileRole, AnalysisLanguage, InventoryFile } from "./types.js";
 
 const LANGUAGE_BY_EXTENSION: Record<string, AnalysisLanguage> = {
+  ".vue": "vue",
   ".ts": "typescript",
   ".tsx": "typescript",
   ".mts": "typescript",
@@ -59,7 +60,7 @@ export function classifyFileRole(filePath: string, language = classifyLanguage(f
   if (CONFIG_NAMES.has(basename) || /(^|\/)(config|configs)\//i.test(filePath)) return "config";
   if (language === "markdown" || /(^|\/)docs?\//i.test(filePath)) return "docs";
   if (INFRA_PATTERNS.some((pattern) => pattern.test(filePath))) return "infrastructure";
-  if (["typescript", "javascript", "python", "go", "rust", "swift", "java", "csharp", "c", "cpp"].includes(language)) return "source";
+  if (["vue", "typescript", "javascript", "python", "go", "rust", "swift", "java", "csharp", "c", "cpp"].includes(language)) return "source";
   return "other";
 }
 
@@ -67,6 +68,7 @@ export function detectProjectTypes(files: InventoryFile[]): string[] {
   const names = new Set(files.map((file) => path.basename(file.path)));
   const detected: string[] = [];
   if (names.has("package.json")) detected.push("node");
+  if (files.some((file) => file.path.endsWith(".vue"))) detected.push("vue");
   if (names.has("pyproject.toml") || names.has("requirements.txt")) detected.push("python");
   if (names.has("go.mod")) detected.push("go");
   if (names.has("Cargo.toml")) detected.push("rust");

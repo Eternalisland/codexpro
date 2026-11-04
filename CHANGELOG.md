@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed cross-session workspace listing: share opened-workspace visibility through the server registry while preserving session-local selection and the legacy session-only `workspaces` array. Added `server_opened_workspaces`, explicit alias addressing in `workspace_id`, and a pre-fix failing / post-fix passing multi-session test.
+- Added bounded Vue SFC script declarations and relative import indexing with original `.vue` line numbers, plus opt-in Python 3 AST parsing for functions/classes and local imports without executing project code; unsupported cases fall back conservatively and have focused smoke coverage.
+
 - Enhanced multi-workspace support: list configured-but-unopened roots without changing the opened-workspaces API, save/select explicit project aliases, and inspect bounded cross-workspace static Java/JS/TS and npm/Maven dependencies with source-line evidence, coverage warnings, and isolated smoke tests.
 
 - Accelerated inferred Java `find_references` by using bounded ripgrep filename candidates before source parsing, prioritizing the declaration file and preserving receiver/overload filtering, partial-coverage warnings, test exclusions, and the bounded index fallback when ripgrep is missing. Added regression cases for limited inventory, Unicode paths, missing ripgrep, and candidate-budget truncation.
