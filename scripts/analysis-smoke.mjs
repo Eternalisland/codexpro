@@ -70,6 +70,24 @@ try {
     '  public String updateUser(String id) { return id; }',
     '}'
   ].join('\n') + '\n');
+  await write('java/example/Strategy.java', [
+    'package example;',
+    '// interface FakeStrategy {}',
+    'public interface Strategy {',
+    '  void execute();',
+    '}',
+    'class Outer {',
+    '  static class Inner {}',
+    '}',
+    'enum Mode { FAST }',
+    'record Entry(String name) {}'
+  ].join('\n') + '\n');
+  await write('java/中文目录/UnicodeCaller.java', [
+    'package example;',
+    'class UnicodeCaller {',
+    '  void run() { UserService service = new UserService(); service.updateUser("张", 1); }',
+    '}'
+  ].join('\n') + '\n');
   await write('java/example/Caller.java', [
     'package example;',
     'public class Caller {',
@@ -210,6 +228,29 @@ try {
   assert(methodRefs.references.some((item) => item.path === 'src/nav-caller.ts'), JSON.stringify(methodRefs));
   assert(!methodRefs.references.some((item) => item.path === 'src/nav-alpha.ts' && item.line === 3));
   const javaApi = await importBuilt('analysis/javaNavigation.js');
+  const scopedOnly = { ...config, analysisLimits: { ...config.analysisLimits, maxInventoryFiles: 1 } };
+  const typeDecl = await javaApi.findJavaSymbol(scopedOnly, guard, workspace,
+    { symbol: 'Strategy', path: 'java/example/Strategy.java' });
+  assert.equal(typeDecl.total, 1, 'file-scoped Java lookup must not require the workspace index');
+  assert.deepEqual(typeDecl.definitions.map(d => [d.kind, d.line, d.column, d.source, d.confidence]),
+    [['type', 3, 18, 'java-source-heuristic', 'inferred']]);
+  assert.equal(typeDecl.truncated, false, 'a complete selected file should not inherit workspace index truncation');
+  assert.equal(typeDecl.coverage.truncated, false);
+  for (const name of ['Outer.Inner', 'Mode', 'Entry']) {
+    const resolved = await javaApi.findJavaSymbol(scopedOnly, guard, workspace,
+      { symbol: name, path: 'java/example/Strategy.java' });
+    assert.equal(resolved.total, 1, `file-scoped Java ${name} should be found`);
+    assert.equal(resolved.definitions[0].kind, 'type');
+  }
+  const commentOnly = await javaApi.findJavaSymbol(scopedOnly, guard, workspace,
+    { symbol: 'FakeStrategy', path: 'java/example/Strategy.java' });
+  assert.equal(commentOnly.total, 0, 'Java comments must not count as type declarations');
+  const scopedMethod = await javaApi.findJavaSymbol(scopedOnly, guard, workspace,
+    { symbol: 'Strategy.execute', path: 'java/example/Strategy.java' });
+  assert.equal(scopedMethod.total, 1, 'method lookup should parse only the specified file');
+  assert.equal(scopedMethod.definitions[0].signature, 'Strategy.execute()');
+  const workspaceType = await javaApi.findJavaSymbol(config, guard, workspace, { symbol: 'Strategy' });
+  assert.equal(workspaceType.total, 1, 'workspace Java lookup should include interface declarations');
   const javaSymbols = await javaApi.findJavaSymbol(config, guard, workspace,
     { symbol: 'UserService.updateUser', path: 'java/example/UserService.java' });
   assert.equal(javaSymbols.total, 2, 'Java method overloads must be distinguishable');
@@ -230,6 +271,47 @@ try {
   assert(selectedJava.references.some(r => r.path === 'test/java/UserServiceTest.java'));
   assert(!selectedJava.references.some(r => r.path === 'java/example/OtherService.java'));
   assert(!selectedJava.references.some(r => r.path === 'java/example/Caller.java' && (r.line === 8 || r.line === 10 || r.line === 11 || r.line === 13)));
+  const limitedInventoryRefs = await javaApi.findJavaReferences(scopedOnly, guard, workspace, {
+    symbol: 'UserService.updateUser', path: 'java/example/UserService.java',
+    parameterTypes: ['String', 'int'], includeTests: true
+  });
+  assert.equal(limitedInventoryRefs.ambiguous, false, 'Java reference lookup must locate the selected declaration without inventory');
+  assert(limitedInventoryRefs.references.some(r => r.path === 'java/example/Caller.java' && r.line === 5),
+    'ripgrep candidates must include the real cross-file caller');
+  assert(limitedInventoryRefs.references.some(r =>
+    r.path === 'java/中文目录/UnicodeCaller.java' && r.line === 3),
+    'ripgrep candidate decoding must preserve Unicode paths');
+  assert(limitedInventoryRefs.references.some(r => r.path === 'test/java/UserServiceTest.java'),
+    'ripgrep candidates must include test callers when requested');
+  assert(!limitedInventoryRefs.references.some(r => r.text.includes('comment') || r.text.includes('doc =')),
+    'candidate filtering must not mistake comments or strings for references');
+  assert.equal(limitedInventoryRefs.coverage.truncated, false);
+  const unscopedInventoryRefs = await javaApi.findJavaReferences(scopedOnly, guard, workspace, {
+    symbol: 'UserService.audit'
+  });
+  assert(unscopedInventoryRefs.references.some(r => r.path === 'java/example/Caller.java' && r.line === 9),
+    'Java method selection without path must work when the workspace inventory is limited');
+  const oneCandidateOnly = { ...config, analysisLimits: { ...config.analysisLimits, maxAnalyzedFiles: 1 } };
+  const partialCandidateRefs = await javaApi.findJavaReferences(oneCandidateOnly, guard, workspace, {
+    symbol: 'UserService.updateUser', path: 'java/example/UserService.java', parameterTypes: ['String', 'int']
+  });
+  assert.equal(partialCandidateRefs.ambiguous, false);
+  assert(partialCandidateRefs.references.some(r => r.is_definition &&
+    r.path === 'java/example/UserService.java'), 'declaration file should be parsed before candidate callers');
+  assert.equal(partialCandidateRefs.truncated, true, 'candidate parsing budget must be visible');
+  assert(partialCandidateRefs.warnings.some(w => /partially analyzed/i.test(w)));
+  const savedPath = process.env.PATH;
+  try {
+    process.env.PATH = path.join(tmp, 'no-ripgrep-bin');
+    const noRipgrepRefs = await javaApi.findJavaReferences(config, guard, workspace, {
+      symbol: 'UserService.audit', path: 'java/example/UserService.java'
+    });
+    assert(noRipgrepRefs.references.some(r => r.path === 'java/example/Caller.java' && r.line === 9));
+    assert(noRipgrepRefs.warnings.some(w => /ripgrep unavailable/i.test(w)));
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+  }
   const noJavaTests = await javaApi.findJavaReferences(config, guard, workspace, {
     symbol: 'UserService.updateUser', path: 'java/example/UserService.java',
     parameterTypes: ['String', 'int'], includeTests: false

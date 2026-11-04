@@ -1,7 +1,12 @@
 import fsp from "node:fs/promises";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import type { CodexProConfig } from "../config.js";
 import type { PathGuard, Workspace } from "../guard.js";
 import { inspectWorkspace } from "./index.js";
+import { classifyFileRole } from "./classify.js";
+import { textScanByteLimit } from "../fsOps.js";
 import { redactSensitiveText } from "../redact.js";
 import type { InventoryFile, AnalysisCoverage } from "./types.js";
 
@@ -223,6 +228,105 @@ async function buildJavaIndex(config: CodexProConfig, guard: PathGuard, workspac
   return result;
 }
 const indexed = buildJavaIndex;
+
+// Use ripgrep only to nominate source files. The Java lexer still decides whether a
+// match is a declaration or a call; no textual hit is reported as a resolved reference.
+async function javaReferenceCandidates(config: CodexProConfig, workspace: Workspace, name: string):
+  Promise<{ paths: string[]; truncated: boolean; warnings: string[] } | null> {
+  const args = ["--files-with-matches", "--null", "--hidden", "--no-ignore",
+    "--fixed-strings", "--no-messages", "--max-filesize", String(textScanByteLimit(config)),
+    "-g", "*.java"];
+  for (const glob of config.blockedGlobs) args.push("-g", "!" + glob);
+  args.push("-e", name, "--", workspace.root);
+  return new Promise((resolve, reject) => {
+    const child = spawn("rg", args, { cwd: workspace.root, shell: false, windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"] });
+    const paths: string[] = [];
+    const decoder = new StringDecoder("utf8");
+    let buffer = "", error = "", truncated = false, settled = false;
+    const finish = (value: { paths: string[]; truncated: boolean; warnings: string[] } | null, failure?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (failure) reject(failure);
+      else resolve(value);
+    };
+    const timeout = setTimeout(() => { truncated = true; child.kill(); }, 30_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (truncated) return;
+      buffer += decoder.write(chunk);
+      let end: number;
+      while ((end = buffer.indexOf("\0")) !== -1) {
+        const candidate = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        if (paths.length >= MAX_FILES) { truncated = true; child.kill(); break; }
+        paths.push(candidate);
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => { error = (error + String(chunk)).slice(-2000); });
+    child.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") finish(null);
+      else finish(null, err);
+    });
+    child.on("close", code => {
+      if (settled) return;
+      if (!truncated && code !== 0 && code !== 1) {
+        finish(null, new Error("ripgrep candidate search failed: " + (error.trim() || "exit " + code)));
+        return;
+      }
+      finish({ paths, truncated, warnings: truncated ?
+        ["Java candidate search stopped at its file or time limit; references may be incomplete."] : [] });
+    });
+  });
+}
+
+async function referenceIndex(config: CodexProConfig, guard: PathGuard, workspace: Workspace, opts: Options):
+  Promise<JavaIndex> {
+  const name = opts.symbol.split(".").at(-1) ?? "";
+  const candidates = await javaReferenceCandidates(config, workspace, name);
+  if (!candidates) {
+    const fallback = await indexed(config, guard, workspace);
+    const notice = "ripgrep unavailable; Java references use the bounded workspace index.";
+    const warnings = [...fallback.warnings, notice];
+    return { ...fallback, warnings, coverage: { ...fallback.coverage, warnings } };
+  }
+  const ordered = new Set<string>();
+  if (opts.path && opts.path.toLowerCase().endsWith(".java"))
+    ordered.add(guard.resolve(workspace, opts.path).relPath);
+  for (const file of candidates.paths) {
+    const rel = path.relative(workspace.root, path.resolve(file)).replaceAll("\\", "/");
+    if (rel === ".." || rel.startsWith("../") || path.isAbsolute(rel) ||
+        !rel.toLowerCase().endsWith(".java") || guard.isBlockedRelativePath(rel)) continue;
+    if (opts.includeTests === false && classifyFileRole(rel, "java") === "test") continue;
+    ordered.add(rel);
+  }
+  const sources: Source[] = [], warnings = [...candidates.warnings, WARN];
+  let bytes = 0, tokens = 0, partial = candidates.truncated;
+  for (const rel of ordered) {
+    if (sources.length >= Math.min(MAX_FILES, config.analysisLimits.maxAnalyzedFiles) ||
+        tokens >= MAX_TOKENS) { partial = true; break; }
+    try {
+      const checked = guard.resolve(workspace, rel);
+      await guard.assertTextFile(checked.absPath, textScanByteLimit(config));
+      const text = await fsp.readFile(checked.absPath, "utf8");
+      const size = Buffer.byteLength(text, "utf8");
+      if (bytes + size > Math.min(MAX_BYTES, config.analysisLimits.maxScannedBytes)) {
+        partial = true; continue;
+      }
+      const parsed = parse({ path: checked.relPath, role: classifyFileRole(checked.relPath, "java") }, text);
+      if (tokens + parsed.source.tokens.length > MAX_TOKENS) { partial = true; continue; }
+      sources.push(parsed.source);
+      bytes += size;
+      tokens += parsed.source.tokens.length;
+      if (parsed.partial) partial = true;
+    } catch { partial = true; }
+  }
+  if (partial) warnings.push("Java reference candidates are only partially analyzed; results may be incomplete.");
+  return { sources, methods: sources.flatMap(s => s.methods),
+    coverage: { inventoryFiles: ordered.size, analyzedFiles: sources.length,
+      scannedBytes: bytes, symbolCount: sources.reduce((sum, s) => sum + s.scopes.length + s.methods.length, 0),
+      relationshipCount: 0, truncated: partial, warnings }, warnings };
+}
 function methodsFor(all: Method[], options: Options) {
   const words = options.symbol.split("."), name = words.at(-1);
   const owner = words.length >= 2 ? words.at(-2) : undefined;
@@ -236,6 +340,30 @@ const definition = (m: Method) => ({
   path: m.path, line: m.line, column: m.column, signature: m.signature,
   parameter_types: m.parameter_types, confidence: "inferred", source: "java-source-heuristic"
 });
+function typesFor(sources: Source[], options: Options) {
+  const parts = options.symbol.split(".");
+  const name = parts.at(-1);
+  return sources.flatMap(source => {
+    if ((options.path && source.path !== options.path) ||
+        (options.includeTests === false && source.role === "test")) return [];
+    return source.scopes.filter(scope => scope.name === name).flatMap(scope => {
+      const owners = source.scopes.filter(parent => parent.open < scope.open && parent.close > scope.close)
+        .sort((a, b) => a.open - b.open).map(parent => parent.name);
+      const qualified = [...owners, scope.name].join(".");
+      if (parts.length > 1 && qualified !== options.symbol &&
+          !qualified.endsWith("." + options.symbol)) return [];
+      return [{
+        name: scope.name, qualified_name: qualified, kind: "type", declaration_kind: scope.kind,
+        path: source.path, line: scope.line, column: scope.column,
+        confidence: "inferred" as const, source: "java-source-heuristic" as const
+      }];
+    });
+  });
+}
+function symbolDefinitions(sources: Source[], methods: Method[], options: Options) {
+  const types = typesFor(sources, options);
+  return types.length ? types : methodsFor(methods, options).map(definition);
+}
 function ownerAt(source: Source, idx: number) {
   return source.scopes.filter(c => c.open < idx && c.close > idx)
     .sort((a, b) => b.open - a.open)[0]?.name;
@@ -265,16 +393,37 @@ function receiver(source: Source, idx: number, classNames: Set<string>): string 
   return type;
 }
 export async function findJavaSymbol(config: CodexProConfig, guard: PathGuard, workspace: Workspace, opts: Options) {
-  if (opts.path) guard.resolve(workspace, opts.path);
-  const index = await indexed(config, guard, workspace), found = methodsFor(index.methods, opts);
   const max = maxResult(opts.maxResults);
-  return { symbol: opts.symbol, definitions: found.slice(0, max).map(definition), total: found.length,
+  if (opts.path) {
+    const checked = guard.resolve(workspace, opts.path);
+    if (!checked.relPath.toLowerCase().endsWith(".java"))
+      return { symbol: opts.symbol, definitions: [], total: 0, truncated: false,
+        coverage: { inventoryFiles: 0, analyzedFiles: 0, scannedBytes: 0, symbolCount: 0,
+          relationshipCount: 0, truncated: false, warnings: [WARN] },
+        warnings: [WARN], supported_languages: ["java"] };
+    await guard.assertTextFile(checked.absPath, textScanByteLimit(config));
+    const text = await fsp.readFile(checked.absPath, "utf8");
+    const source = parse({ path: checked.relPath, role: classifyFileRole(checked.relPath, "java") }, text);
+    const found = symbolDefinitions([source.source], source.source.methods,
+      { ...opts, path: checked.relPath });
+    const warnings = [...(source.partial ? ["Java file token budget reached; results may be incomplete."] : []), WARN];
+    const coverage: AnalysisCoverage = { inventoryFiles: 1, analyzedFiles: 1,
+      scannedBytes: Buffer.byteLength(text, "utf8"),
+      symbolCount: source.source.scopes.length + source.source.methods.length,
+      relationshipCount: 0, truncated: source.partial, warnings };
+    return { symbol: opts.symbol, definitions: found.slice(0, max), total: found.length,
+      truncated: found.length > max || source.partial,
+      coverage, warnings, supported_languages: ["java"] };
+  }
+  const index = await indexed(config, guard, workspace);
+  const found = symbolDefinitions(index.sources, index.methods, opts);
+  return { symbol: opts.symbol, definitions: found.slice(0, max), total: found.length,
     truncated: found.length > max || index.coverage.truncated,
     coverage: index.coverage, warnings: index.warnings, supported_languages: ["java"] };
 }
 export async function findJavaReferences(config: CodexProConfig, guard: PathGuard, workspace: Workspace, opts: Options) {
   if (opts.path) guard.resolve(workspace, opts.path);
-  const index = await indexed(config, guard, workspace), found = methodsFor(index.methods, opts);
+  const index = await referenceIndex(config, guard, workspace, opts), found = methodsFor(index.methods, opts);
   const max = maxResult(opts.maxResults);
   if (found.length !== 1) return {
     symbol: opts.symbol, definitions: found.slice(0, max).map(definition),

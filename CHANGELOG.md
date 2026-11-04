@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Accelerated inferred Java `find_references` by using bounded ripgrep filename candidates before source parsing, prioritizing the declaration file and preserving receiver/overload filtering, partial-coverage warnings, test exclusions, and the bounded index fallback when ripgrep is missing. Added regression cases for limited inventory, Unicode paths, missing ripgrep, and candidate-budget truncation.
+- Optimized Java heuristic `find_symbol`: explicit Java file paths now use a bounded single-file parse instead of building the workspace index; class, interface, enum, record, and nested-type declarations are also searchable without JDT. Added file-scoped and workspace regression coverage.
 - Fixed Eclipse JDT LS workspace initialization by supplying `initializationOptions.workspaceFolders` in addition to standard LSP `workspaceFolders`, with Maven import enabled and mock-protocol validation; confirmed with a real JDT LS 1.62.0 and JDK 25 on a disposable Maven workspace.
 - Fixed optional JDT LS selection on large Java repositories: select declarations from the requested file instead of requiring the bounded workspace-wide heuristic index, accept hierarchical/flat/empty LSP document symbols, and report sanitized JDT protocol diagnostics. Added overload, limited-budget and empty-symbol regression cases; isolate ordinary MCP smoke tests from machine-wide JDT settings.
 - Added optional on-demand Eclipse JDT LS backend for Java symbol/reference resolution, implementations, and type hierarchy. Uses bounded stdio LSP, per-workspace process reuse, document sync, idle shutdown, and explicit fallback to inferred results when unavailable; mock protocol integration tests added.
