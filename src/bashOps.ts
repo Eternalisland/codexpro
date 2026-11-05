@@ -180,6 +180,17 @@ const SAFE_DIAGNOSTIC_COMMANDS = new Set([
   "rg --version"
 ]);
 
+const POWER_SHELL_SAFE_EXACT = new Set([
+  ...SAFE_DIAGNOSTIC_COMMANDS,
+  "pwd", "Get-Location",
+  "where.exe node", "where.exe npm", "where.exe npx", "where.exe git", "where.exe rg",
+  "npm test", "pnpm test", "yarn test", "bun test",
+  "python -m pytest", "python3 -m pytest", "pytest", "uv run pytest",
+  "go test ./...", "cargo test", "cargo check", "cargo clippy",
+  "tsc", "npx tsc", "eslint", "npx eslint", "biome check",
+  "git status", "git diff", "git log", "git branch"
+]);
+
 function compact(command: string): string {
   return command.trim().replace(/\s+/g, " ");
 }
@@ -203,6 +214,13 @@ function assertSafeCommand(config: CodexProConfig, command: string): void {
 
   const raw = command.trim();
   const normalized = compact(command);
+  if (process.platform === "win32" && (config.bashRuntime === "powershell" || config.bashRuntime === "pwsh")) {
+    // PowerShell evaluates parenthesized expressions even without a shell separator.
+    // Unlike Bash, a prefix-only allowlist is not safe: use exact commands or a
+    // tightly scoped package-script grammar in safe mode.
+    if (POWER_SHELL_SAFE_EXACT.has(normalized) || isAllowedPackageScript(normalized)) return;
+    throw new CodexProError("Command is not in the safe PowerShell allowlist: " + normalized + ". Use read/search/git tools, or full mode only for trusted repositories.");
+  }
   if (SAFE_DIAGNOSTIC_COMMANDS.has(normalized)) return;
   for (const pattern of SAFE_BLOCKED_PATTERNS) {
     if (pattern.test(raw) || pattern.test(normalized)) {
@@ -285,6 +303,10 @@ export function makeRestrictedBashEnv(
   };
   if (process.platform === "win32") {
     restricted.USERPROFILE = home;
+    if (env.SystemRoot) restricted.SystemRoot = env.SystemRoot;
+    if (env.WINDIR) restricted.WINDIR = env.WINDIR;
+    if (env.ComSpec) restricted.ComSpec = env.ComSpec;
+    if (env.PATHEXT) restricted.PATHEXT = env.PATHEXT;
     const appData = isUsableAbsoluteDir(env.APPDATA);
     const localAppData = isUsableAbsoluteDir(env.LOCALAPPDATA);
     if (appData) restricted.APPDATA = appData;
@@ -371,6 +393,47 @@ function usableExecutable(candidate: string | undefined, exists: (value: string)
   }
 }
 
+function powerShellArgs(command: string): string[] {
+  // PowerShell picks npm.ps1 before npm.cmd in many Windows installations. Invoke the
+  // .cmd shim explicitly so the host execution policy is never bypassed.
+  const nativeCommand = command.replace(/^(\s*)(npm|pnpm|npx|yarn)(?=\s|$)/i,
+    (_match, indentation: string, runner: string) => indentation + "& " + runner.toLowerCase() + ".cmd");
+  const source = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "$codexproUtf8 = [System.Text.UTF8Encoding]::new($false)",
+    "[Console]::OutputEncoding = $codexproUtf8",
+    "$OutputEncoding = $codexproUtf8",
+    "$global:LASTEXITCODE = $null",
+    "try {",
+    "  & {",
+    nativeCommand,
+    "  } | ForEach-Object { [Console]::Out.WriteLine([string]$_) }",
+    "  $codexproSuccess = $?",
+    "  $codexproExit = $global:LASTEXITCODE",
+    "  if ($null -ne $codexproExit) { exit [int]$codexproExit }",
+    "  if (-not $codexproSuccess) { exit 1 }",
+    "  exit 0",
+    "} catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }"
+  ].join("\n");
+  // EncodedCommand avoids shell-argument quoting ambiguity and supports Unicode on
+  // Windows PowerShell 5.1 as well as PowerShell 7 without creating a script file.
+  return ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+    Buffer.from(source, "utf16le").toString("base64")];
+}
+
+function windowsPowerShellCandidates(runtime: "powershell" | "pwsh",
+  env: NodeJS.ProcessEnv, pathCommands: (command: string) => string[]): string[] {
+  if (runtime === "powershell") {
+    const systemRoot = env.SystemRoot || env.WINDIR || "C:\\Windows";
+    return [path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+      ...pathCommands("powershell.exe")];
+  }
+  const programFiles = env.ProgramW6432 || env.ProgramFiles || "C:\\Program Files";
+  return [path.win32.join(programFiles, "PowerShell", "7", "pwsh.exe"),
+    ...pathCommands("pwsh.exe")];
+}
+
 export function resolveBashInvocation(config: CodexProConfig, options: BashResolverOptions = {}): BashInvocation {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
@@ -378,12 +441,37 @@ export function resolveBashInvocation(config: CodexProConfig, options: BashResol
   const pathCommands = options.pathCommands ?? ((command: string) => commandPathCandidates(command, env, platform));
 
   if (platform !== "win32") {
+    if (config.bashRuntime === "powershell" || config.bashRuntime === "pwsh") {
+      throw new CodexProError("PowerShell runtime is supported only on Windows; use native-bash on this platform.");
+    }
     const executable = config.bashExecutable?.trim() || (fs.existsSync("/bin/bash") ? "/bin/bash" : "bash");
     return {
       runtime: config.bashRuntime === "wsl" ? "wsl" : "native-bash",
       executable,
       args: (command) => ["-lc", command],
       source: config.bashExecutable ? "configured" : "system"
+    };
+  }
+
+  if (config.bashRuntime === "powershell" || config.bashRuntime === "pwsh") {
+    const runtime = config.bashRuntime;
+    const expectedName = runtime === "powershell" ? "powershell.exe" : "pwsh.exe";
+    const configured = usableExecutable(config.bashExecutable, exists);
+    if (config.bashExecutable && !configured) {
+      throw new CodexProError("Configured PowerShell executable was not found: " + config.bashExecutable);
+    }
+    if (configured && path.win32.basename(configured).toLowerCase() !== expectedName) {
+      throw new CodexProError("The selected PowerShell runtime requires an executable named " + expectedName + ".");
+    }
+    const candidates = windowsPowerShellCandidates(runtime, env, pathCommands);
+    const discovered = candidates.find((candidate) => usableExecutable(candidate, exists));
+    const executable = configured ?? discovered;
+    if (!executable) {
+      throw new CodexProError("No " + expectedName + " executable was found. Set CODEXPRO_BASH_EXECUTABLE to its absolute path.");
+    }
+    return {
+      runtime, executable, args: powerShellArgs,
+      source: configured ? "configured" : discovered === candidates[0] ? "system" : "path"
     };
   }
 
@@ -619,9 +707,9 @@ export async function runBash(
       cwd,
       env: makeEnv(config),
       stdio: ["ignore", "pipe", "pipe"],
-      // Give every verification shell its own process group. This makes crash ownership explicit
-      // on every platform while timeout/cancel still terminate the full tree via terminateProcessTree().
-      detached: true,
+      // Keep Bash process groups for restart recovery. Detached Windows PowerShell processes
+      // lose redirected stdout/stderr, so run them attached; taskkill still handles their child tree.
+      detached: process.platform !== "win32" || (invocation.runtime !== "powershell" && invocation.runtime !== "pwsh"),
       windowsHide: true
     });
 

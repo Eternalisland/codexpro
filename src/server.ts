@@ -1864,9 +1864,11 @@ export function createCodexProServer(
       const gitRuntime = gitRuntimeStatus(config);
       check("bash runtime", config.bashMode === "off" ? "warn" : bashRuntime.available ? "pass" : "fail", JSON.stringify(bashRuntime));
       check("git runtime", gitRuntime.available ? "pass" : "fail", JSON.stringify(gitRuntime));
-      const mixedWindowsToolchain = process.platform === "win32" && bashRuntime.selected_runtime === "wsl";
+      const mixedWindowsToolchain = process.platform === "win32" && bashRuntime.selected_runtime === "wsl";
+      const nativePowerShell = process.platform === "win32" && (bashRuntime.selected_runtime === "powershell" || bashRuntime.selected_runtime === "pwsh");
       const alignedWindowsToolchain = !mixedWindowsToolchain && (
-        process.platform !== "win32" ||
+        process.platform !== "win32" ||
+        (nativePowerShell && gitRuntime.available) ||
         (bashRuntime.source === "git-for-windows" && gitRuntime.source === "git-for-windows")
       );
       check(
@@ -1875,7 +1877,7 @@ export function createCodexProServer(
         mixedWindowsToolchain
           ? "Bash is running through explicit WSL while Git tools use the Windows process; set a matching Git executable or use native-bash."
           : alignedWindowsToolchain
-            ? "Bash and Git use the same native toolchain."
+            ? nativePowerShell ? "PowerShell and Git both execute natively on Windows." : "Bash and Git use the same native toolchain."
             : "Bash and Git executables could not be proven to share a toolchain; inspect server_config and set CODEXPRO_GIT_EXECUTABLE if needed."
       );
       check(
@@ -2072,13 +2074,14 @@ export function createCodexProServer(
             check("bash policy", "warn", "bash disabled");
           } else {
             const bashProbeOptions = { timeoutMs: 10_000, sessionId: config.bashSessionId };
-            const pwd = await runBash(config, guard, workspace, "pwd", bashProbeOptions);
+            const nativePowerShellProbe = process.platform === "win32" && (bashRuntime.selected_runtime === "powershell" || bashRuntime.selected_runtime === "pwsh");
+            const pwd = await runBash(config, guard, workspace, nativePowerShellProbe ? "Get-Location" : "pwd", bashProbeOptions);
             const shellTools = ["node", "npm", "npx", "git", "rg"];
             const shellToolDetails: string[] = [];
             const shellToolVersions = new Map<string, string>();
             const missingShellTools: string[] = [];
             for (const tool of shellTools) {
-              const location = await runBash(config, guard, workspace, `command -v ${tool}`, bashProbeOptions);
+              const location = await runBash(config, guard, workspace, nativePowerShellProbe ? `where.exe ${tool}` : `command -v ${tool}`, bashProbeOptions);
               const version = await runBash(config, guard, workspace, `${tool} --version`, bashProbeOptions);
               const locationText = location.exitCode === 0 ? location.stdout.trim().split(/\r?\n/)[0] : "unavailable";
               const versionText = version.exitCode === 0 ? version.stdout.trim().split(/\r?\n/)[0] : "unavailable";

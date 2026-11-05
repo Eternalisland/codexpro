@@ -85,9 +85,9 @@ Options:
   --bash-transcript <compact|full>
                              Chat transcript for bash results. Default: compact.
                              full prints raw stdout/stderr in chat.
-  --bash-runtime <auto|native-bash|wsl>
-                             Windows Bash runtime. auto prefers Git for Windows and never silently uses WSL.
-  --bash-executable <path>  Explicit bash.exe/wsl.exe path for the selected runtime.
+  --bash-runtime <auto|native-bash|wsl|powershell|pwsh>
+                             Windows command runtime: powershell = Windows PowerShell 5.1, pwsh = PowerShell 7; auto remains Git Bash.
+  --bash-executable <path>  Optional executable path for the selected runtime.
   --git-executable <path>   Explicit Git executable; otherwise native Git follows Git for Windows Bash when available.
   --full-bash-transcript    Shortcut for --bash-transcript full.
   --bash-session <id>       Local bash session label exposed to ChatGPT.
@@ -945,8 +945,8 @@ function bashTranscriptOption(args, profile = {}) {
 
 function bashRuntimeOption(args, profile = {}) {
   const value = optionValue(args, profile, 'bashRuntime', ['CODEXPRO_BASH_RUNTIME'], 'auto');
-  if (value === 'auto' || value === 'native-bash' || value === 'wsl') return value;
-  throw new Error('--bash-runtime must be auto, native-bash, or wsl.');
+  if (value === 'auto' || value === 'native-bash' || value === 'wsl' || value === 'powershell' || value === 'pwsh') return value;
+  throw new Error('--bash-runtime must be auto, native-bash, wsl, powershell, or pwsh.');
 }
 
 function bashExecutableOption(args, profile = {}) {
@@ -4219,8 +4219,8 @@ async function main() {
   traceDirectoryForControlPanel = resolvedTraceDir || path.join(codexProHome(), 'traces');
   traceModeForControlPanel = mcpTrace;
   validateChoice('bash', bash, ['off', 'safe', 'full']);
-  if (bashRuntime === 'wsl' && process.platform !== 'win32') {
-    throw new Error('--bash-runtime=wsl is only supported on Windows.');
+  if (['wsl', 'powershell', 'pwsh'].includes(bashRuntime) && process.platform !== 'win32') {
+    throw new Error('--bash-runtime=' + bashRuntime + ' is only supported on Windows.');
   }
   validateChoice('write', write, ['off', 'handoff', 'workspace']);
   validateChoice('tool-mode', toolMode, ['minimal', 'standard', 'full']);

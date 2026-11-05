@@ -61,6 +61,14 @@ CodexPro 的认证就在这个 URL 里的 token。不要分享该 URL。
 | --- | --- |
 | ![打开 Plugins 并点击加号](docs/images/chatgpt-plugins-add.png) | ![填写 New Plugin 表单](docs/images/chatgpt-plugin-details.png) |
 
+Windows PowerShell 现已支持作为 CodexPro 的命令执行运行时（不依赖 Git Bash）。在 Windows PowerShell 5.1 中启动：
+
+```powershell
+codexpro start --bash-runtime powershell
+```
+
+如已安装 PowerShell 7，可改为 `--bash-runtime pwsh`。也可设置 `$env:CODEXPRO_BASH_RUNTIME = "powershell"` 后启动。原 `auto` 模式继续使用 Git for Windows Bash，避免旧脚本不兼容。PowerShell 执行器统一输出 UTF-8，对 npm/pnpm/npx/yarn 使用 .cmd 启动入口（不绕过脚本执行策略），保留超时、取消和退出码处理。安全模式仅接受明确列出的只读诊断命令和符合语法约束的测试脚本；复杂 PowerShell 语法必须在可信仓库明确启用 `--bash full`。无需用 `git status`、`Get-Content` 等命令读取仓库，优先使用 CodexPro 的 Git、读取和搜索工具。
+
 同一仓库日常启动：
 
 ```bash

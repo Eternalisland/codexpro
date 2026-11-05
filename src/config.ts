@@ -6,7 +6,7 @@ import type { ProtocolTraceMode } from "./protocolTrace.js";
 
 export type BashMode = "off" | "safe" | "full";
 export type BashTranscriptMode = "compact" | "full";
-export type BashRuntime = "auto" | "native-bash" | "wsl";
+export type BashRuntime = "auto" | "native-bash" | "wsl" | "powershell" | "pwsh";
 export type CodexSessionsMode = "off" | "metadata" | "read";
 export type WriteMode = "off" | "handoff" | "workspace";
 export type ToolMode = "minimal" | "standard" | "full";
@@ -183,7 +183,7 @@ function bashTranscriptFrom(value: string | undefined): BashTranscriptMode {
 }
 
 function bashRuntimeFrom(value: string | undefined): BashRuntime {
-  if (value === "auto" || value === "native-bash" || value === "wsl") return value;
+  if (value === "auto" || value === "native-bash" || value === "wsl" || value === "powershell" || value === "pwsh") return value;
   return "auto";
 }
 

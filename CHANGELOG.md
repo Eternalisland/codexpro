@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added opt-in native Windows PowerShell 5.1 (`--bash-runtime powershell`) and PowerShell 7 (`pwsh`) execution for bash/run_checks/start_check without changing the Git Bash `auto` default. Uses UTF-16LE encoded scripts, UTF-8 output, npm .cmd shims, preserved native exit codes, constrained safe-mode commands and Windows process-tree cancellation; Windows PowerShell regression tests added.
+
 - Added persistent, revision-checked task checkpoints with step progress, linked workspaces, file/check references, and read-only recovery plans; recover_work now discovers unfinished tasks after reconnect. Includes stale-write, cross-session, and cross-workspace drift regression tests.
 
 - Added bounded, read-only `analyze_api_contracts` for static Vue/TS/JS fetch/EventSource/Axios-style requests, Spring controller routes, Java WebClient-style literal URLs and FastAPI decorator routes. Returns independent frontend-to-Java and Java-to-Python candidate links with workspace IDs, file/line evidence, SSE hints, match limits and partial-coverage warnings. Includes 3-workspace regression tests and tool-mode gates; no runtime call-graph claims.

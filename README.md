@@ -51,6 +51,8 @@ CodexPro auth is the token already in that URL. Do not share the URL.
 | --- | --- |
 | ![Open Plugins and click the plus button](docs/images/chatgpt-plugins-add.png) | ![Complete the New Plugin form](docs/images/chatgpt-plugin-details.png) |
 
+Windows PowerShell is supported as an opt-in command runtime without Git Bash. On Windows, run `codexpro start --bash-runtime powershell` for Windows PowerShell 5.1, or `--bash-runtime pwsh` for an installed PowerShell 7. The default `auto` preserves the existing Git for Windows Bash behavior. PowerShell uses UTF-8 streams, native .cmd package-manager shims to avoid PowerShell script-policy conflicts, and the existing process timeout/cancellation controls. Safe mode permits a restricted set of diagnostics and test scripts; opt into `--bash full` only for trusted workspaces. Use dedicated CodexPro tools for Git status/diffs and file reads.
+
 Daily use from the same repo:
 
 ```bash
